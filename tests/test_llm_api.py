@@ -62,6 +62,7 @@ def test_prompt_enhancer_model_options_match_node_contract():
         "bytedance/doubao-seed-2.0-pro (RunningHub)",
         "glm-5v-turbo (RunningHub)",
         "llama.cpp (本地)",
+        "strata (local)",
     ]
 
 
@@ -78,6 +79,219 @@ def test_llamacpp_max_tokens_widget_limits():
     module = _load_module()
 
     assert module.PROMPT_ENHANCER_MAX_TOKENS[module.LLAMACPP_MODEL] == (512, 768)
+
+
+def _enhance_strata(client, **kwargs):
+    options = dict(
+        system_prompt="Enhance the video prompt.", user_prompt="A rainy street.",
+        task_type="t2v", duration=5, ratio="16:9", seed=42,
+    )
+    options.update(kwargs)
+    return client.enhance(**options)
+
+
+@pytest.mark.parametrize("base_url", [
+    "http://127.0.0.1:8080", "http://127.0.0.1:8080/v1/",
+    "http://127.0.0.1:8080/v1/chat/completions",
+])
+def test_strata_normalizes_url_and_unloads_without_an_api_key(tmp_path, monkeypatch, base_url):
+    module = _load_module()
+    monkeypatch.delenv("STRATA_API_KEY", raising=False)
+    requests = []
+
+    def opener(request, timeout):
+        requests.append((request, timeout))
+        if request.full_url.endswith("/unload?wait=1"):
+            return _Response({"status": "unloaded", "loaded": False})
+        return _Response({"choices": [{"message": {"content": "```text\nEnhanced\n```"}}]})
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", base_url=base_url,
+        config_path=tmp_path / "missing.yaml", opener=opener, timeout=600.0,
+    )
+    assert _enhance_strata(client).prompt == "Enhanced"
+    assert [r.full_url for r, _ in requests] == [
+        "http://127.0.0.1:8080/v1/chat/completions",
+        "http://127.0.0.1:8080/v1/unload?wait=1",
+    ]
+    assert all(r.get_header("Authorization") is None for r, _ in requests)
+    assert all(t == 600.0 for _, t in requests)
+    assert json.loads(requests[-1][0].data) == {}
+    payload = json.loads(requests[0][0].data)
+    assert payload["model"] == "strata"
+    assert payload["stream"] is False
+    assert payload["reasoning_effort"] == "none"
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["max_tokens"] == 131072
+    assert payload["seed"] == 42
+    assert "force_unload" not in payload
+
+
+def test_strata_sends_custom_parameters_and_images_without_unloading(tmp_path):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request)
+        return _Response({"choices": [{"message": {"content": "Enhanced", "reasoning_content": "Thinking"}}]})
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "local-key", base_url="https://host.test/proxy/v1",
+        force_unload=False, temperature=0.4, reasoning_effort="low",
+        config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    assert _enhance_strata(client, task_type="i2v", image_urls=[_png_data_uri()], max_tokens=8192).prompt == "Enhanced"
+    assert len(requests) == 1
+    assert requests[0].full_url == "https://host.test/proxy/v1/chat/completions"
+    assert requests[0].get_header("Authorization") == "Bearer local-key"
+    payload = json.loads(requests[0].data)
+    assert payload["model"] == "strata"
+    assert payload["max_tokens"] == 8192
+    assert {key: payload[key] for key in client.strata_parameters} == {
+        "temperature": 0.4, "reasoning_effort": "low",
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    assert any(item["type"] == "image_url" for item in payload["messages"][-1]["content"])
+
+
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "high"])
+def test_strata_thinking_setting_returns_final_answer_only(tmp_path, effort):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(json.loads(request.data))
+        return _Response({"choices": [{"message": {
+            "content": "Final video prompt", "reasoning_content": "Private thinking",
+            "thinking": "Other thinking", "reasoning": "More thinking",
+        }}]})
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", force_unload=False, reasoning_effort=effort,
+        config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    assert _enhance_strata(client).prompt == "Final video prompt"
+    assert requests[0]["reasoning_effort"] == effort
+    assert requests[0]["chat_template_kwargs"]["enable_thinking"] is (effort != "none")
+    assert set(requests[0]).isdisjoint({
+        "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty",
+        "frequency_penalty", "penalty_last_n", "reasoning_budget_tokens",
+    })
+
+
+@pytest.mark.parametrize("content", [
+    "<think>Private thinking</think>Final video prompt",
+    "<THINK>Private\nthinking</THINK>```text\nFinal video prompt\n```",
+    "Private thinking</think>Final video prompt",
+    "<thinking>Private thinking</thinking>Final video prompt",
+    "<think>Private <think>nested thinking</think> more thinking</think>Final video prompt",
+    "Final <think>Private thinking</think>video prompt",
+    [
+        {"type": "thinking", "text": "Private thinking"},
+        {"type": "reasoning", "text": "More private thinking"},
+        {"type": "text", "text": "Final video prompt"},
+    ],
+    [{"type": "output_text", "text": "Final video prompt"}],
+])
+def test_strata_filters_thinking_from_answer_content(tmp_path, content):
+    module = _load_module()
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", force_unload=False,
+        config_path=tmp_path / "missing.yaml",
+        opener=lambda request, timeout: _Response({"choices": [{"message": {"content": content}}]}),
+    )
+    assert _enhance_strata(client).prompt == "Final video prompt"
+
+
+@pytest.mark.parametrize("content", [
+    None, "<think>Private thinking</think>", "<think>Unfinished thinking",
+    [{"type": "thinking", "text": "Only private thinking"}],
+])
+def test_strata_rejects_reasoning_only_answers(tmp_path, content):
+    module = _load_module()
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", force_unload=False,
+        config_path=tmp_path / "missing.yaml",
+        opener=lambda request, timeout: _Response({"choices": [{"message": {
+            "content": content, "reasoning_content": "Do not use as a fallback",
+        }}]}),
+    )
+    with pytest.raises(module.PromptEnhancerApiError, match="empty prompt"):
+        _enhance_strata(client)
+
+
+@pytest.mark.parametrize("failure", ["http", "timeout", "empty", "missing", "invalid_json"])
+def test_strata_unloads_even_when_generation_fails(tmp_path, failure):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request.full_url)
+        if "/unload" in request.full_url:
+            return _Response({"status": "not loaded"})
+        if failure == "http":
+            raise module.urllib.error.HTTPError(request.full_url, 500, "failed", {}, io.BytesIO(b'{"error":{"message":"inference failed"}}'))
+        if failure == "timeout":
+            raise TimeoutError("timed out")
+        if failure == "invalid_json":
+            response = _Response({})
+            response.read = lambda: b"not json"
+            return response
+        return _Response({} if failure == "missing" else {"choices": [{"message": {"content": None}}]})
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError):
+        _enhance_strata(client)
+    assert len(requests) == 2
+    assert requests[-1].endswith("/v1/unload?wait=1")
+
+
+@pytest.mark.parametrize("generation_failed", [False, True])
+def test_strata_reports_unload_failures_and_preserves_generation_error(tmp_path, generation_failed):
+    module = _load_module()
+
+    def opener(request, timeout):
+        if "/unload" in request.full_url:
+            return _Response({"status": "unsupported"})
+        if generation_failed:
+            raise TimeoutError("original inference timed out")
+        return _Response({"choices": [{"message": {"content": "Enhanced"}}]})
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError, match="force_unload failed") as exc_info:
+        _enhance_strata(client)
+    if generation_failed:
+        assert "original inference timed out" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("options", [
+    {"base_url": "file:///tmp/strata"}, {"base_url": "http://host/v1?key=secret"},
+    {"base_url": "http://user:password@host/v1"},
+    {"reasoning_effort": "invalid"}, {"temperature": float("nan")},
+    {"temperature": 2.1},
+    {"timeout": 0},
+])
+def test_strata_rejects_invalid_options_before_requests(tmp_path, options):
+    module = _load_module()
+    with pytest.raises(ValueError):
+        module.PromptEnhancerClient(module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", **options)
+
+
+@pytest.mark.parametrize("key_source", ["config", "environment"])
+def test_strata_optional_api_key_configuration(tmp_path, monkeypatch, key_source):
+    module = _load_module()
+    config_path = tmp_path / "config.yaml"
+    if key_source == "config":
+        config_path.write_text("STRATA_API_KEY: config-key\n", encoding="utf-8")
+        monkeypatch.setenv("STRATA_API_KEY", "ignored-key")
+    else:
+        monkeypatch.setenv("STRATA_API_KEY", "environment-key")
+    client = module.PromptEnhancerClient(module.STRATA_MODEL, "", config_path=config_path)
+    assert client.api_key == ("config-key" if key_source == "config" else "environment-key")
 
 
 @pytest.mark.parametrize(

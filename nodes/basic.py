@@ -36,6 +36,8 @@ from ..utils import (
     audio_data_uris,
     image_tensor_data_uris,
     LLAMACPP_MODEL,
+    STRATA_MODEL,
+    STRATA_BASE_URL,
     MINIMAX_MODEL,
     PROMPT_ENHANCER_MAX_TOKENS,
     PROMPT_ENHANCER_MODELS,
@@ -3429,7 +3431,9 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
         options: list = []
         for model_name in PROMPT_ENHANCER_MODELS:
             inputs: list = []
-            if model_name != LLAMACPP_MODEL:
+            if model_name == STRATA_MODEL:
+                inputs.extend(cls._strata_inputs())
+            elif model_name != LLAMACPP_MODEL:
                 inputs.append(cls._api_key_input())
             if model_name == MINIMAX_MODEL:
                 inputs.extend(
@@ -3498,6 +3502,31 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             options.append(io.DynamicCombo.Option(model_name, inputs))
         return options
 
+    @staticmethod
+    def _strata_inputs() -> list:
+        return [
+            io.String.Input(
+                "base_url", default=STRATA_BASE_URL,
+                tooltip="Strata server root, /v1 base URL, or full /v1/chat/completions URL. Supports proxy prefixes.",
+            ),
+            io.String.Input(
+                "apikey", default="",
+                tooltip="Optional Strata API key. Falls back to STRATA_API_KEY in config.yaml or the environment. Leave empty for an unauthenticated local server.",
+            ),
+            io.Boolean.Input(
+                "force_unload", default=True,
+                tooltip="Call Strata /v1/unload after every inference, including failures. The next request reloads the model; disable to keep it loaded between project tasks.",
+            ),
+            io.Combo.Input(
+                "reasoning_effort", options=["none", "low", "medium", "high"], default="none",
+                tooltip="'none' disables thinking; low, medium, and high enable it. Only the final answer is returned; thinking consumes the output token budget.",
+            ),
+            io.Float.Input(
+                "temperature", default=0.7, min=0.0, max=2.0, step=0.05,
+                tooltip="Sampling temperature; 0 uses greedy decoding.",
+            ),
+        ]
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
@@ -3506,7 +3535,7 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             category=CATEGORY_MULTITRACK,
             description=(
                 "Use MiniMax H3-Context-IR, a configured third-party multimodal LLM, "
-                "or a local llama.cpp model to enhance a multitrack video prompt."
+                "or a local llama.cpp / Strata model to enhance a multitrack video prompt."
             ),
             is_input_list=True,
             not_idempotent=True,
@@ -3801,9 +3830,19 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             )
 
         try:
+            client_options: dict = {}
+            if selected_model == STRATA_MODEL:
+                client_options = {
+                    "base_url": str(_unwrap_list_scalar(model_config.get("base_url"), STRATA_BASE_URL)),
+                    "temperature": float(_unwrap_list_scalar(model_config.get("temperature"), 0.7)),
+                    "reasoning_effort": str(_unwrap_list_scalar(model_config.get("reasoning_effort"), "none")),
+                    "force_unload": bool(_unwrap_list_scalar(model_config.get("force_unload"), True)),
+                    "timeout": 600.0,
+                }
             client = PromptEnhancerClient(
                 selected_model,
                 selected_api_key,
+                **client_options,
             )
             is_minimax = selected_model == MINIMAX_MODEL
             image_urls = image_tensor_data_uris(

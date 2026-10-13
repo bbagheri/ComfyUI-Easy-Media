@@ -5,6 +5,7 @@ export const PROMPT_ENHANCER_MODELS = {
   runningHubDoubao: 'bytedance/doubao-seed-2.0-pro (RunningHub)',
   runningHubGlm: 'glm-5v-turbo (RunningHub)',
   local: 'llama.cpp (本地)',
+  strata: 'strata (local)',
 } as const
 
 export interface PromptEnhancerBalanceRequest {
@@ -96,7 +97,7 @@ export const PROMPT_ENHANCER_ACCOUNT_PROVIDERS: readonly PromptEnhancerAccountPr
   },
   {
     id: 'local',
-    modelNames: [PROMPT_ENHANCER_MODELS.local],
+    modelNames: [PROMPT_ENHANCER_MODELS.local, PROMPT_ENHANCER_MODELS.strata],
   },
 ]
 

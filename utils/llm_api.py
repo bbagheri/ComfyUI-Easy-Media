@@ -8,6 +8,7 @@ import io as bytes_io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -33,10 +34,14 @@ ZHIPU_MODEL = "glm-5v-turbo (智谱)"
 RUNNINGHUB_DOUBAO_MODEL = "bytedance/doubao-seed-2.0-pro (RunningHub)"
 RUNNINGHUB_GLM_MODEL = "glm-5v-turbo (RunningHub)"
 LLAMACPP_MODEL = "llama.cpp (本地)"
+STRATA_MODEL = "strata (local)"
+STRATA_BASE_URL = "http://127.0.0.1:8080/v1"
 
 __all__ = [
     "ApiModelConfig",
     "LLAMACPP_MODEL",
+    "STRATA_MODEL",
+    "STRATA_BASE_URL",
     "MINIMAX_MODEL",
     "MODEL_CONFIGS",
     "PROMPT_ENHANCER_MAX_TOKENS",
@@ -72,6 +77,7 @@ PROMPT_ENHANCER_MODELS = [
     RUNNINGHUB_DOUBAO_MODEL,
     RUNNINGHUB_GLM_MODEL,
     LLAMACPP_MODEL,
+    STRATA_MODEL,
 ]
 
 
@@ -92,6 +98,14 @@ class ApiModelConfig:
 
 
 MODEL_CONFIGS = {
+    STRATA_MODEL: ApiModelConfig(
+        provider="strata",
+        api_model="strata",
+        endpoint=f"{STRATA_BASE_URL}/chat/completions",
+        api_key_name="STRATA_API_KEY",
+        default_max_tokens=131072,
+        max_tokens_limit=262144,
+    ),
     MINIMAX_MODEL: ApiModelConfig(
         provider="minimax",
         api_model="MiniMax-H3",
@@ -625,6 +639,10 @@ class PromptEnhancerClient:
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         config_path: str | os.PathLike[str] | None = None,
+        base_url: str = STRATA_BASE_URL,
+        temperature: float = 0.7,
+        reasoning_effort: str = "none",
+        force_unload: bool = True,
     ) -> None:
         if model == LLAMACPP_MODEL:
             raise NotImplementedError("llama.cpp local prompt enhancement is not implemented yet.")
@@ -632,6 +650,22 @@ class PromptEnhancerClient:
             self.config = MODEL_CONFIGS[model]
         except KeyError as exc:
             raise ValueError(f"Unsupported prompt-enhancer model: {model}") from exc
+        self.strata_parameters: dict = {}
+        self.force_unload = model == STRATA_MODEL and bool(force_unload)
+        if model == STRATA_MODEL:
+            endpoint, self.unload_endpoint = self._strata_endpoints(base_url)
+            self.config = replace(self.config, endpoint=endpoint)
+            if reasoning_effort not in ("none", "low", "medium", "high"):
+                raise ValueError("Strata reasoning_effort must be none, low, medium, or high.")
+            if not math.isfinite(float(temperature)) or not 0.0 <= float(temperature) <= 2.0:
+                raise ValueError("Strata temperature must be between 0 and 2.")
+            self.strata_parameters = {
+                "temperature": float(temperature),
+                "reasoning_effort": reasoning_effort,
+                "chat_template_kwargs": {"enable_thinking": reasoning_effort != "none"},
+            }
+        if not math.isfinite(float(timeout)) or timeout <= 0:
+            raise ValueError("API timeout must be a positive finite number.")
         explicit_api_key = (api_key or "").strip()
         config_api_key = (
             load_api_key_from_config(self.config.api_key_name, config_path)
@@ -648,7 +682,7 @@ class PromptEnhancerClient:
                 if environment_api_key:
                     break
         self.api_key = explicit_api_key or config_api_key or environment_api_key
-        if not self.api_key:
+        if not self.api_key and model != STRATA_MODEL:
             raise ValueError(
                 "API key is required. Enter apikey or configure "
                 f"{self.config.api_key_name} in config.yaml."
@@ -660,6 +694,75 @@ class PromptEnhancerClient:
         self.upload_endpoint = H3_UPLOAD_ENDPOINT
         self.upload_purpose = H3_UPLOAD_PURPOSE
 
+    @staticmethod
+    def _strata_endpoints(base_url: str) -> tuple[str, str]:
+        """Accept a server root, API base, or full completion URL, including proxy prefixes."""
+        parsed = urllib.parse.urlsplit(str(base_url).strip())
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("Strata base_url must be an HTTP or HTTPS URL.")
+        if parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("Strata base_url cannot contain credentials, a query, or a fragment.")
+        path = parsed.path.rstrip("/")
+        if path.endswith("/chat/completions"):
+            path = path[:-len("/chat/completions")]
+        if not path.endswith("/v1"):
+            path += "/v1"
+        api_base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+        return f"{api_base}/chat/completions", f"{api_base}/unload?wait=1"
+
+    def _strata_completion(self, payload: dict) -> dict:
+        """Release the remote engine after successful or failed inference when requested."""
+        request_error: PromptEnhancerApiError | None = None
+        try:
+            return self._request_json("POST", self.config.endpoint, payload)
+        except PromptEnhancerApiError as exc:
+            request_error = exc
+            raise
+        finally:
+            if self.force_unload:
+                try:
+                    # Empty body targets the active engine, even when 'strata' is only an API alias.
+                    response = self._request_json("POST", self.unload_endpoint, {})
+                    if response.get("status") not in ("unloaded", "not loaded"):
+                        raise PromptEnhancerApiError(f"Unexpected unload status: {response.get('status')}")
+                except PromptEnhancerApiError as exc:
+                    message = f"Strata force_unload failed: {exc}"
+                    if request_error is not None:
+                        message = f"{request_error}; {message}"
+                    raise PromptEnhancerApiError(message) from (request_error or exc)
+
+    @staticmethod
+    def _strata_answer_text(content: object) -> str:
+        """Keep final text only, rejecting reasoning blocks and unfinished thinking."""
+        if isinstance(content, list):
+            text = "".join(
+                item["text"] for item in content
+                if isinstance(item, dict)
+                and item.get("type") in ("text", "output_text")
+                and isinstance(item.get("text"), str)
+            )
+        else:
+            text = content if isinstance(content, str) else ""
+        text = strip_text_code_fence(text)
+        answer_parts: list[str] = []
+        thinking_depth = 0
+        offset = 0
+        for tag in re.finditer(r"<(/?)(?:think|thinking)\b[^>]*>", text, re.IGNORECASE):
+            if tag.group(1):
+                if thinking_depth:
+                    thinking_depth -= 1
+                else:
+                    # A missing opening tag means the preceding text was reasoning.
+                    answer_parts.clear()
+                offset = tag.end()
+            else:
+                if not thinking_depth:
+                    answer_parts.append(text[offset:tag.start()])
+                thinking_depth += 1
+        if not thinking_depth:
+            answer_parts.append(text[offset:])
+        return strip_text_code_fence("".join(answer_parts))
+
     def _request_json(
         self,
         method: str,
@@ -667,15 +770,14 @@ class PromptEnhancerClient:
         payload: dict | None = None,
     ) -> dict:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
             url,
             data=data,
             method=method,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=headers,
         )
         return self._execute_request(request)
 
@@ -1175,18 +1277,24 @@ class PromptEnhancerClient:
             file_count=max(0, int(file_count)),
             request_logger=request_logger,
         )
-        response = self._request_json("POST", self.config.endpoint, payload)
+        if self.config.provider == "strata":
+            payload.update(self.strata_parameters)
+            response = self._strata_completion(payload)
+        else:
+            response = self._request_json("POST", self.config.endpoint, payload)
         try:
             prompt = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise PromptEnhancerApiError(
                 f"{self.config.provider} API response did not contain generated text."
             ) from exc
-        if isinstance(prompt, list):
+        if self.config.provider == "strata":
+            prompt = self._strata_answer_text(prompt)
+        elif isinstance(prompt, list):
             prompt = "".join(
                 str(item.get("text", "")) for item in prompt if isinstance(item, dict)
             )
-        prompt = strip_text_code_fence(str(prompt))
+        prompt = strip_text_code_fence(str(prompt or ""))
         if not prompt:
             raise PromptEnhancerApiError(
                 f"{self.config.provider} API returned an empty prompt."

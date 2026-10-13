@@ -168,6 +168,14 @@ If an older workflow connects directly to the editor's media outputs, insert `Mu
 
 > **Note:** Some models support automatic download via the built-in Easy-Media model download interface. Model files will be placed in the `ComfyUI/models/` directory.
 
+### Local Strata Prompt Enhancement
+
+`easy multiTrackPromptEnhancer` and `easy multitrackPromptEnhanceToProject` support **strata (local)**. Start [Strata](https://github.com/Niko1221/Strata) separately, then select this model. `base_url` defaults to `http://127.0.0.1:8080/v1`; a server root or full Chat Completions URL also works, including reverse-proxy prefixes. Requests use the server's default model (`strata`). The optional `apikey` falls back to `STRATA_API_KEY` in `config.yaml` or the environment.
+
+The six model options are `base_url`, `apikey`, `max_tokens` (default 128K / 131072), `temperature`, `reasoning_effort`, and `force_unload`. `reasoning_effort=none` disables thinking (default); `low`, `medium`, and `high` enable it. Only final answer text is returned: separate reasoning fields, thinking content blocks, and inline `<think>` blocks are excluded. An answer containing only reasoning raises an error instead of forwarding it. Thinking still consumes the total output token budget. Requests have a fixed 600-second timeout; other sampling settings follow the server defaults. Images require Strata's vision support; videos are sampled into up to 24 frames each. Audio is omitted.
+
+`force_unload` defaults to true and calls `/v1/unload?wait=1` after each inference, including failures. Unload errors are reported. The next request reloads the model. Disable it to keep Strata loaded while enhancing multiple project tasks. Strata runs on the machine named in `base_url`; `127.0.0.1` means the ComfyUI server's machine. See [Strata's API documentation](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#using-it).
+
 <a id="multitrack-project"></a>
 
 ### 🎞️ MultiTrack Project

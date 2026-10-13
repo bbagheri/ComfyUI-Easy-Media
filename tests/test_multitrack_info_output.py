@@ -295,6 +295,8 @@ def _load_basic_module():
     utils_module.video_data_uris = lambda values: []
     utils_module.video_frame_data_uris = lambda values, **kwargs: []
     utils_module.LLAMACPP_MODEL = "llama.cpp (本地)"
+    utils_module.STRATA_MODEL = "strata (local)"
+    utils_module.STRATA_BASE_URL = "http://127.0.0.1:8080/v1"
     utils_module.MINIMAX_MODEL = "h3-context-ir (海螺官方)"
     utils_module.PROMPT_ENHANCER_MODELS = [
         utils_module.MINIMAX_MODEL,
@@ -303,6 +305,7 @@ def _load_basic_module():
         "doubao (RunningHub)",
         "glm (RunningHub)",
         utils_module.LLAMACPP_MODEL,
+        utils_module.STRATA_MODEL,
     ]
     utils_module.PROMPT_ENHANCER_MAX_TOKENS = {
         "doubao (火山引擎)": (4096, 131072),
@@ -310,6 +313,7 @@ def _load_basic_module():
         "doubao (RunningHub)": (4096, 131072),
         "glm (RunningHub)": (65536, 131072),
         utils_module.LLAMACPP_MODEL: (512, 768),
+        utils_module.STRATA_MODEL: (131072, 262144),
     }
     utils_module.PromptEnhancerApiError = RuntimeError
     utils_module.PromptEnhancerClient = object
@@ -4893,6 +4897,11 @@ def test_multitrack_prompt_enhancer_schema_exposes_requested_inputs_and_outputs(
             if model_name == module.LLAMACPP_MODEL
             else {"apikey", "max_tokens"}
         )
+        if model_name == module.STRATA_MODEL:
+            expected_inputs = {
+                "apikey", "base_url", "force_unload", "reasoning_effort",
+                "temperature", "max_tokens",
+            }
         assert set(child_inputs) == expected_inputs
         value_name = "max_size" if model_name == module.LLAMACPP_MODEL else "max_tokens"
         assert child_inputs[value_name].kwargs["default"] == default
@@ -5199,6 +5208,7 @@ def test_multitrack_prompt_enhance_to_project_has_chinese_localization():
     assert "媒体" in translation["description"]
     assert "纯文本" not in json.dumps(translation, ensure_ascii=False)
     assert set(translation["inputs"]) == {
+        "base_url", "force_unload", "reasoning_effort", "temperature",
         "tracks_info",
         "llama_model",
         "model",
@@ -5244,6 +5254,41 @@ def test_multitrack_prompt_enhancer_returns_user_prompt_unchanged_when_disabled(
 
     assert output.values == ("Keep this prompt unchanged", "", "")
     assert output.expand is None
+
+
+def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(monkeypatch):
+    module = _load_basic_module()
+    calls = []
+
+    class FakeClient:
+        def __init__(self, model, api_key, **kwargs):
+            calls.append((model, api_key, kwargs))
+
+        def enhance(self, **kwargs):
+            return types.SimpleNamespace(prompt=f"enhanced-{len(calls)}", task_id="", file_ids="")
+
+    monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
+    info = {
+        "frame_rate": 24, "format": "MiniMax", "media": {},
+        "tracks": [{"type": "task", "segments": [
+            {"start_frame": 0, "end_frame": 120, "content": {"user_prompt": "first"}},
+            {"start_frame": 120, "end_frame": 240, "content": {"user_prompt": "second"}},
+        ]}],
+    }
+    options = {
+        "model": [module.STRATA_MODEL], "base_url": ["http://host:8080/v1"],
+        "apikey": ["local-key"], "force_unload": [False],
+        "reasoning_effort": ["low"], "temperature": [0.4], "max_tokens": [8192],
+    }
+    updated, prompts = module.MultiTrackPromptEnhanceToProject.execute(
+        tracks_info=[info], model=[options], seed=[42],
+    ).values
+    assert prompts == ["enhanced-1", "enhanced-2"]
+    assert [item["content"]["user_prompt"] for item in updated["tracks"][0]["segments"]] == prompts
+    assert info["tracks"][0]["segments"][0]["content"]["user_prompt"] == "first"
+    expected_options = {key: value[0] for key, value in options.items() if key not in {"model", "apikey", "max_tokens"}}
+    expected_options["timeout"] = 600.0
+    assert calls == [(module.STRATA_MODEL, "local-key", expected_options)] * 2
 
 
 def test_multitrack_prompt_enhance_to_project_resolves_deferred_reference_video(
@@ -5620,6 +5665,7 @@ def test_multitrack_prompt_enhancer_has_complete_chinese_localization():
     translation = node_defs["easy multiTrackPromptEnhancer"]
 
     assert set(translation["inputs"]) == {
+        "base_url", "force_unload", "reasoning_effort", "temperature",
         "system_prompt",
         "user_prompt",
         "type",
