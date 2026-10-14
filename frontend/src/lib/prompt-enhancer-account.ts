@@ -6,6 +6,7 @@ export const PROMPT_ENHANCER_MODELS = {
   runningHubGlm: 'glm-5v-turbo (RunningHub)',
   local: 'llama.cpp (本地)',
   strata: 'strata (local)',
+  compatibleLocal: 'openai_compatible (local)',
 } as const
 
 export interface PromptEnhancerBalanceRequest {
@@ -97,7 +98,7 @@ export const PROMPT_ENHANCER_ACCOUNT_PROVIDERS: readonly PromptEnhancerAccountPr
   },
   {
     id: 'local',
-    modelNames: [PROMPT_ENHANCER_MODELS.local, PROMPT_ENHANCER_MODELS.strata],
+    modelNames: [PROMPT_ENHANCER_MODELS.local, PROMPT_ENHANCER_MODELS.compatibleLocal, PROMPT_ENHANCER_MODELS.strata],
   },
 ]
 

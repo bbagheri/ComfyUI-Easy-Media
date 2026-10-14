@@ -62,7 +62,7 @@ def test_prompt_enhancer_model_options_match_node_contract():
         "bytedance/doubao-seed-2.0-pro (RunningHub)",
         "glm-5v-turbo (RunningHub)",
         "llama.cpp (本地)",
-        "strata (local)",
+        "openai_compatible (local)",
     ]
 
 
@@ -106,7 +106,7 @@ def test_strata_normalizes_url_and_unloads_without_an_api_key(tmp_path, monkeypa
         return _Response({"choices": [{"message": {"content": "```text\nEnhanced\n```"}}]})
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", base_url=base_url,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=True, base_url=base_url,
         config_path=tmp_path / "missing.yaml", opener=opener, timeout=600.0,
     )
     assert _enhance_strata(client).prompt == "Enhanced"
@@ -120,8 +120,8 @@ def test_strata_normalizes_url_and_unloads_without_an_api_key(tmp_path, monkeypa
     payload = json.loads(requests[0][0].data)
     assert payload["model"] == "strata"
     assert payload["stream"] is False
-    assert payload["reasoning_effort"] == "none"
-    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["reasoning_effort"] == "high"
+    assert "chat_template_kwargs" not in payload
     assert "max_tokens" not in payload
     assert payload["seed"] == 42
     assert "force_unload" not in payload
@@ -136,7 +136,7 @@ def test_strata_sends_custom_parameters_and_images_without_unloading(tmp_path):
         return _Response({"choices": [{"message": {"content": "Enhanced", "reasoning_content": "Thinking"}}]})
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "local-key", base_url="https://host.test/proxy/v1",
+        module.OPENAI_COMPATIBLE_MODEL, "local-key", model_name="strata", base_url="https://host.test/proxy/v1",
         force_unload=False, temperature=0.4, reasoning_effort="low",
         config_path=tmp_path / "missing.yaml", opener=opener,
     )
@@ -147,9 +147,8 @@ def test_strata_sends_custom_parameters_and_images_without_unloading(tmp_path):
     payload = json.loads(requests[0].data)
     assert payload["model"] == "strata"
     assert payload["max_tokens"] == 8192
-    assert {key: payload[key] for key in client.strata_parameters} == {
+    assert {key: payload[key] for key in client.local_parameters} == {
         "temperature": 0.4, "reasoning_effort": "low",
-        "chat_template_kwargs": {"enable_thinking": True},
     }
     assert any(item["type"] == "image_url" for item in payload["messages"][-1]["content"])
 
@@ -186,7 +185,7 @@ def test_strata_retries_explicit_output_limit_without_truncating_inputs(
         }}]})
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", force_unload=force_unload,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=force_unload,
         config_path=tmp_path / "missing.yaml", opener=opener,
     )
     result = _enhance_strata(
@@ -213,7 +212,7 @@ def test_strata_does_not_retry_without_a_smaller_positive_allowance(tmp_path, st
         raise _strata_context_error(module, request, 8192, available, status=status)
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=True, config_path=tmp_path / "missing.yaml", opener=opener,
     )
     with pytest.raises(module.PromptEnhancerApiError):
         _enhance_strata(client, max_tokens=8192)
@@ -238,7 +237,7 @@ def test_strata_does_not_guess_an_output_limit_or_retry_other_errors(tmp_path, e
         )
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", force_unload=False,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=False,
         config_path=tmp_path / "missing.yaml", opener=opener,
     )
     with pytest.raises(module.PromptEnhancerApiError):
@@ -262,7 +261,7 @@ def test_strata_context_fit_retries_once_and_unloads_after_retry_failure(tmp_pat
         raise _strata_context_error(module, request, 2048, 1024)
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=True, config_path=tmp_path / "missing.yaml", opener=opener,
     )
     with pytest.raises(module.PromptEnhancerApiError, match="timed out" if retry_failure == "timeout" else "at most 1024"):
         _enhance_strata(client, max_tokens=8192)
@@ -283,12 +282,12 @@ def test_strata_thinking_setting_returns_final_answer_only(tmp_path, effort):
         }}]})
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", force_unload=False, reasoning_effort=effort,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=False, reasoning_effort=effort,
         config_path=tmp_path / "missing.yaml", opener=opener,
     )
     assert _enhance_strata(client).prompt == "Final video prompt"
     assert requests[0]["reasoning_effort"] == effort
-    assert requests[0]["chat_template_kwargs"]["enable_thinking"] is (effort != "none")
+    assert "chat_template_kwargs" not in requests[0]
     assert set(requests[0]).isdisjoint({
         "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty",
         "frequency_penalty", "penalty_last_n", "reasoning_budget_tokens",
@@ -312,7 +311,7 @@ def test_strata_thinking_setting_returns_final_answer_only(tmp_path, effort):
 def test_strata_filters_thinking_from_answer_content(tmp_path, content):
     module = _load_module()
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", force_unload=False,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=False,
         config_path=tmp_path / "missing.yaml",
         opener=lambda request, timeout: _Response({"choices": [{"message": {"content": content}}]}),
     )
@@ -326,7 +325,7 @@ def test_strata_filters_thinking_from_answer_content(tmp_path, content):
 def test_strata_rejects_reasoning_only_answers(tmp_path, content):
     module = _load_module()
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", force_unload=False,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=False,
         config_path=tmp_path / "missing.yaml",
         opener=lambda request, timeout: _Response({"choices": [{"message": {
             "content": content, "reasoning_content": "Do not use as a fallback",
@@ -356,7 +355,7 @@ def test_strata_unloads_even_when_generation_fails(tmp_path, failure):
         return _Response({} if failure == "missing" else {"choices": [{"message": {"content": None}}]})
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=True, config_path=tmp_path / "missing.yaml", opener=opener,
     )
     with pytest.raises(module.PromptEnhancerApiError):
         _enhance_strata(client)
@@ -376,7 +375,7 @@ def test_strata_reports_unload_failures_and_preserves_generation_error(tmp_path,
         return _Response({"choices": [{"message": {"content": "Enhanced"}}]})
 
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", force_unload=True, config_path=tmp_path / "missing.yaml", opener=opener,
     )
     with pytest.raises(module.PromptEnhancerApiError, match="force_unload failed") as exc_info:
         _enhance_strata(client)
@@ -394,7 +393,7 @@ def test_strata_reports_unload_failures_and_preserves_generation_error(tmp_path,
 def test_strata_rejects_invalid_options_before_requests(tmp_path, options):
     module = _load_module()
     with pytest.raises(ValueError):
-        module.PromptEnhancerClient(module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", **options)
+        module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", config_path=tmp_path / "missing.yaml", **options)
 
 
 @pytest.mark.parametrize("key_source", ["config", "environment"])
@@ -406,7 +405,7 @@ def test_strata_optional_api_key_configuration(tmp_path, monkeypatch, key_source
         monkeypatch.setenv("STRATA_API_KEY", "ignored-key")
     else:
         monkeypatch.setenv("STRATA_API_KEY", "environment-key")
-    client = module.PromptEnhancerClient(module.STRATA_MODEL, "", config_path=config_path)
+    client = module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", config_path=config_path)
     assert client.api_key == ("config-key" if key_source == "config" else "environment-key")
 
 
@@ -435,7 +434,7 @@ def test_strata_address_priority_is_node_config_then_local_default(tmp_path, exp
 
     options = {} if explicit is None else {"base_url": explicit}
     client = module.PromptEnhancerClient(
-        module.STRATA_MODEL, "local-key", config_path=config_path, opener=opener, **options,
+        module.OPENAI_COMPATIBLE_MODEL, "local-key", model_name="strata", force_unload=True, config_path=config_path, opener=opener, **options,
     )
     assert _enhance_strata(client).prompt == "Enhanced"
     assert requests == [f"{expected_base}/chat/completions", f"{expected_base}/unload?wait=1"]
@@ -445,8 +444,139 @@ def test_strata_reports_invalid_configured_address_when_node_address_is_empty(tm
     module = _load_module()
     config_path = tmp_path / "config.yaml"
     config_path.write_text("STRATA_BASE_URL: file:///invalid-config-url\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="Strata base_url must be an HTTP or HTTPS URL"):
-        module.PromptEnhancerClient(module.STRATA_MODEL, "local-key", config_path=config_path)
+    with pytest.raises(ValueError, match="Local base_url must be an HTTP or HTTPS URL"):
+        module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "local-key", model_name="strata", config_path=config_path)
+
+
+@pytest.mark.parametrize(("explicit", "configured", "expected"), [
+    ("manual-model", "configured-model", "manual-model"),
+    ("  manual-model  ", "configured-model", "manual-model"),
+    ("", "configured-model", "configured-model"),
+    ("", "", "served-model"),
+])
+def test_local_model_name_priority_and_default_request_parameters(tmp_path, explicit, configured, expected):
+    module = _load_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"OPENAI_LOCAL_MODEL_NAME: {json.dumps(configured)}\n", encoding="utf-8")
+    requests = []
+
+    def opener(request, timeout):
+        requests.append((request.get_method(), request.full_url, json.loads(request.data) if request.data else None))
+        if request.get_method() == "GET":
+            return _Response({"data": [{"id": "served-model"}]})
+        return _Response({"choices": [{"message": {
+            "content": "<think>Private reasoning</think>Final prompt", "reasoning_content": "Private reasoning",
+        }}]})
+
+    client = module.PromptEnhancerClient(
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name=explicit,
+        config_path=config_path, opener=opener,
+    )
+    assert _enhance_strata(client).prompt == "Final prompt"
+    assert len(requests) == (2 if not explicit.strip() and not configured else 1)
+    if len(requests) == 2:
+        assert requests[0] == ("GET", "http://127.0.0.1:8080/v1/models", None)
+    payload = requests[-1][2]
+    assert payload["model"] == expected
+    assert payload["reasoning_effort"] == "high"
+    assert set(payload).isdisjoint({"max_tokens", "force_unload", "chat_template_kwargs", "enable_thinking"})
+    assert not any("/unload" in url for _, url, _ in requests)
+
+
+def test_local_model_discovery_accepts_strata_aliases_and_uses_proxy_prefix(tmp_path):
+    module = _load_module()
+    urls = []
+
+    def opener(request, timeout):
+        urls.append(request.full_url)
+        if request.get_method() == "GET":
+            return _Response({"data": [
+                {"id": "served-qwen", "aliases": ["strata", "qwen"]},
+                {"id": "strata", "aliases": ["strata", "qwen"]},
+                {"id": "qwen", "aliases": ["strata", "qwen"]},
+            ]})
+        assert json.loads(request.data)["model"] == "served-qwen"
+        return _Response({"choices": [{"message": {"content": "Final prompt"}}]})
+
+    client = module.PromptEnhancerClient(
+        module.OPENAI_COMPATIBLE_MODEL, "", base_url="https://host.test/proxy/v1/chat/completions",
+        config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    assert _enhance_strata(client).prompt == "Final prompt"
+    assert urls == ["https://host.test/proxy/v1/models", "https://host.test/proxy/v1/chat/completions"]
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"data": []}, {"data": "invalid"}, {"data": [{"id": " "}]},
+    {"data": [{"id": "model-one"}, {"id": "model-two"}]},
+])
+def test_local_model_discovery_requires_an_unambiguous_model(tmp_path, response):
+    module = _load_module()
+    methods = []
+
+    def opener(request, timeout):
+        methods.append(request.get_method())
+        return _Response(response)
+
+    client = module.PromptEnhancerClient(
+        module.OPENAI_COMPATIBLE_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError, match="Fill model_name explicitly"):
+        _enhance_strata(client)
+    assert methods == ["GET"]
+
+
+def test_local_model_discovery_failure_requests_an_explicit_model_name(tmp_path):
+    module = _load_module()
+
+    def opener(request, timeout):
+        raise module.urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+
+    client = module.PromptEnhancerClient(
+        module.OPENAI_COMPATIBLE_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError, match="Fill model_name explicitly.*HTTP 404"):
+        _enhance_strata(client)
+
+
+def test_local_configuration_overrides_legacy_strata_configuration(tmp_path, monkeypatch):
+    module = _load_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "OPENAI_LOCAL_BASE_URL: https://local.test/v1\nSTRATA_BASE_URL: https://legacy.test/v1\n"
+        "OPENAI_LOCAL_API_KEY: local-key\nSTRATA_API_KEY: legacy-key\n"
+        "OPENAI_LOCAL_MODEL_NAME: configured-model\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_LOCAL_API_KEY", "environment-key")
+    client = module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "", config_path=config_path)
+    assert client.config.endpoint == "https://local.test/v1/chat/completions"
+    assert client.config.api_model == "configured-model"
+    assert client.api_key == "local-key"
+
+
+def test_legacy_strata_provider_name_remains_accepted_by_client(tmp_path):
+    module = _load_module()
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", model_name="strata", config_path=tmp_path / "missing.yaml",
+        opener=lambda request, timeout: _Response({"choices": [{"message": {"content": "Final prompt"}}]}),
+    )
+    assert _enhance_strata(client).prompt == "Final prompt"
+
+
+def test_local_explicit_output_limit_is_not_capped_by_an_assumed_model_context(tmp_path):
+    module = _load_module()
+    payloads = []
+
+    def opener(request, timeout):
+        payloads.append(json.loads(request.data))
+        return _Response({"choices": [{"message": {"content": "Final prompt"}}]})
+
+    client = module.PromptEnhancerClient(
+        module.OPENAI_COMPATIBLE_MODEL, "", model_name="large-context-model",
+        config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    assert _enhance_strata(client, max_tokens=300000).prompt == "Final prompt"
+    assert payloads[0]["max_tokens"] == 300000
 
 
 @pytest.mark.parametrize(

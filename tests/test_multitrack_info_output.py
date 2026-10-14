@@ -303,7 +303,7 @@ def _load_basic_module():
     utils_module.video_data_uris = lambda values: []
     utils_module.video_frame_data_uris = lambda values, **kwargs: []
     utils_module.LLAMACPP_MODEL = "llama.cpp (本地)"
-    utils_module.STRATA_MODEL = "strata (local)"
+    utils_module.OPENAI_COMPATIBLE_MODEL = "openai_compatible (local)"
     utils_module.STRATA_BASE_URL = "http://127.0.0.1:8080/v1"
     utils_module.MINIMAX_MODEL = "h3-context-ir (海螺官方)"
     utils_module.PROMPT_ENHANCER_MODELS = [
@@ -313,7 +313,7 @@ def _load_basic_module():
         "doubao (RunningHub)",
         "glm (RunningHub)",
         utils_module.LLAMACPP_MODEL,
-        utils_module.STRATA_MODEL,
+        utils_module.OPENAI_COMPATIBLE_MODEL,
     ]
     utils_module.PROMPT_ENHANCER_MAX_TOKENS = {
         "doubao (火山引擎)": (4096, 131072),
@@ -4908,12 +4908,15 @@ def test_multitrack_prompt_enhancer_schema_exposes_requested_inputs_and_outputs(
         value_name = "max_size" if model_name == module.LLAMACPP_MODEL else "max_tokens"
         assert child_inputs[value_name].kwargs["default"] == default
         assert child_inputs[value_name].kwargs["max"] == maximum
-    strata_inputs = {port.name: port for port in model_options[module.STRATA_MODEL]}
+    strata_inputs = {port.name: port for port in model_options[module.OPENAI_COMPATIBLE_MODEL]}
     assert set(strata_inputs) == {
-        "apikey", "base_url", "force_unload", "reasoning_effort", "temperature", "max_tokens",
+        "apikey", "base_url", "model_name", "force_unload", "reasoning_effort", "temperature", "max_tokens",
     }
     assert strata_inputs["max_tokens"].kwargs["default"] == ""
     assert strata_inputs["base_url"].kwargs["default"] == ""
+    assert strata_inputs["model_name"].kwargs["default"] == ""
+    assert strata_inputs["reasoning_effort"].kwargs["default"] == "high"
+    assert strata_inputs["force_unload"].kwargs["default"] is False
     assert "without sending max_tokens" in strata_inputs["max_tokens"].kwargs["tooltip"]
     assert all(input_port.kwargs.get("tooltip") for input_port in schema.inputs)
     assert all(output_port.kwargs.get("tooltip") for output_port in schema.outputs)
@@ -5217,7 +5220,7 @@ def test_multitrack_prompt_enhance_to_project_has_chinese_localization():
     assert "媒体" in translation["description"]
     assert "纯文本" not in json.dumps(translation, ensure_ascii=False)
     assert set(translation["inputs"]) == {
-        "base_url", "force_unload", "reasoning_effort", "temperature",
+        "base_url", "model_name", "force_unload", "reasoning_effort", "temperature",
         "tracks_info",
         "llama_model",
         "model",
@@ -5291,7 +5294,7 @@ def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(mon
         ]}],
     }
     options = {
-        "model": [module.STRATA_MODEL], "base_url": [base_url],
+        "model": [module.OPENAI_COMPATIBLE_MODEL], "base_url": [base_url], "model_name": ["qwen-local"],
         "apikey": ["local-key"], "force_unload": [False],
         "reasoning_effort": ["low"], "temperature": [0.4], "max_tokens": [output_limit],
     }
@@ -5303,7 +5306,7 @@ def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(mon
     assert info["tracks"][0]["segments"][0]["content"]["user_prompt"] == "first"
     expected_options = {key: value[0] for key, value in options.items() if key not in {"model", "apikey", "max_tokens"}}
     expected_options["timeout"] = 600.0
-    assert calls == [(module.STRATA_MODEL, "local-key", expected_options)] * 2
+    assert calls == [(module.OPENAI_COMPATIBLE_MODEL, "local-key", expected_options)] * 2
     assert events == ["comfy_cleanup", "strata_request"] * 2
 
 
@@ -5329,7 +5332,7 @@ def test_multitrack_strata_cleans_comfyui_before_request(monkeypatch, force_unlo
     monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
     output = module.MultiTrackPromptEnhancer.execute(
         system_prompt=["System"], user_prompt=["User"],
-        model=[{"model": module.STRATA_MODEL, "force_unload": force_unload, "max_tokens": output_limit}],
+        model=[{"model": module.OPENAI_COMPATIBLE_MODEL, "force_unload": force_unload, "max_tokens": output_limit}],
     )
     assert output.values == ("enhanced", "", "")
     assert events == ["comfy_cleanup", "strata_request"]
@@ -5343,7 +5346,7 @@ def test_multitrack_strata_rejects_invalid_output_limits_before_inference(monkey
     with pytest.raises(RuntimeError, match="Prompt enhancement failed"):
         module.MultiTrackPromptEnhancer.execute(
             system_prompt=["System"], user_prompt=["User"],
-            model=[{"model": module.STRATA_MODEL, "max_tokens": output_limit}],
+            model=[{"model": module.OPENAI_COMPATIBLE_MODEL, "max_tokens": output_limit}],
         )
 
 
@@ -5365,7 +5368,7 @@ def test_multitrack_strata_stops_before_request_when_comfyui_cleanup_fails(monke
     with pytest.raises(RuntimeError, match="Failed to release ComfyUI model memory"):
         module.MultiTrackPromptEnhancer.execute(
             system_prompt=["System"], user_prompt=["User"],
-            model=[{"model": module.STRATA_MODEL}],
+            model=[{"model": module.OPENAI_COMPATIBLE_MODEL}],
         )
 
 
@@ -5384,7 +5387,7 @@ def test_multitrack_cloud_or_disabled_enhancer_keeps_comfyui_models(monkeypatch,
     monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
     output = module.MultiTrackPromptEnhancer.execute(
         system_prompt=["System"], user_prompt=["User"], enabled=[enabled],
-        model=[{"model": module.PROMPT_ENHANCER_MODELS[1] if enabled else module.STRATA_MODEL}],
+        model=[{"model": module.PROMPT_ENHANCER_MODELS[1] if enabled else module.OPENAI_COMPATIBLE_MODEL}],
     )
     assert output.values == ("enhanced" if enabled else "User", "", "")
 
@@ -5763,7 +5766,7 @@ def test_multitrack_prompt_enhancer_has_complete_chinese_localization():
     translation = node_defs["easy multiTrackPromptEnhancer"]
 
     assert set(translation["inputs"]) == {
-        "base_url", "force_unload", "reasoning_effort", "temperature",
+        "base_url", "model_name", "force_unload", "reasoning_effort", "temperature",
         "system_prompt",
         "user_prompt",
         "type",
