@@ -42,6 +42,12 @@ class _CustomType(_PortType):
     pass
 
 
+class _MultiType:
+    @staticmethod
+    def Input(port, types):
+        return port
+
+
 class _NodeOutput:
     def __init__(self, *values, **kwargs):
         self.values = values
@@ -182,6 +188,7 @@ def _load_basic_module():
         LatentUpscaleModel=_PortType,
         Mask=_PortType,
         Model=_PortType,
+        MultiType=_MultiType,
         NodeOutput=_NodeOutput,
         Schema=_Schema,
         String=_PortType,
@@ -314,7 +321,6 @@ def _load_basic_module():
         "doubao (RunningHub)": (4096, 131072),
         "glm (RunningHub)": (65536, 131072),
         utils_module.LLAMACPP_MODEL: (512, 768),
-        utils_module.STRATA_MODEL: (131072, 262144),
     }
     utils_module.PromptEnhancerApiError = RuntimeError
     utils_module.PromptEnhancerClient = object
@@ -4898,15 +4904,17 @@ def test_multitrack_prompt_enhancer_schema_exposes_requested_inputs_and_outputs(
             if model_name == module.LLAMACPP_MODEL
             else {"apikey", "max_tokens"}
         )
-        if model_name == module.STRATA_MODEL:
-            expected_inputs = {
-                "apikey", "base_url", "force_unload", "reasoning_effort",
-                "temperature", "max_tokens",
-            }
         assert set(child_inputs) == expected_inputs
         value_name = "max_size" if model_name == module.LLAMACPP_MODEL else "max_tokens"
         assert child_inputs[value_name].kwargs["default"] == default
         assert child_inputs[value_name].kwargs["max"] == maximum
+    strata_inputs = {port.name: port for port in model_options[module.STRATA_MODEL]}
+    assert set(strata_inputs) == {
+        "apikey", "base_url", "force_unload", "reasoning_effort", "temperature", "max_tokens",
+    }
+    assert strata_inputs["max_tokens"].kwargs["default"] == ""
+    assert strata_inputs["base_url"].kwargs["default"] == ""
+    assert "without sending max_tokens" in strata_inputs["max_tokens"].kwargs["tooltip"]
     assert all(input_port.kwargs.get("tooltip") for input_port in schema.inputs)
     assert all(output_port.kwargs.get("tooltip") for output_port in schema.outputs)
     assert [output.name for output in schema.outputs] == [
@@ -5257,7 +5265,9 @@ def test_multitrack_prompt_enhancer_returns_user_prompt_unchanged_when_disabled(
     assert output.expand is None
 
 
-def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(monkeypatch):
+@pytest.mark.parametrize(("output_limit", "expected_limit"), [(8192, 8192), ("", None)])
+@pytest.mark.parametrize("base_url", ["", "http://host:8080/v1"])
+def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(monkeypatch, output_limit, expected_limit, base_url):
     module = _load_basic_module()
     calls = []
     events = []
@@ -5269,6 +5279,7 @@ def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(mon
 
         def enhance(self, **kwargs):
             events.append("strata_request")
+            assert kwargs["max_tokens"] == expected_limit
             return types.SimpleNamespace(prompt=f"enhanced-{len(calls)}", task_id="", file_ids="")
 
     monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
@@ -5280,9 +5291,9 @@ def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(mon
         ]}],
     }
     options = {
-        "model": [module.STRATA_MODEL], "base_url": ["http://host:8080/v1"],
+        "model": [module.STRATA_MODEL], "base_url": [base_url],
         "apikey": ["local-key"], "force_unload": [False],
-        "reasoning_effort": ["low"], "temperature": [0.4], "max_tokens": [8192],
+        "reasoning_effort": ["low"], "temperature": [0.4], "max_tokens": [output_limit],
     }
     updated, prompts = module.MultiTrackPromptEnhanceToProject.execute(
         tracks_info=[info], model=[options], seed=[42],
@@ -5297,26 +5308,43 @@ def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(mon
 
 
 @pytest.mark.parametrize("force_unload", [False, True])
-def test_multitrack_strata_cleans_comfyui_before_request(monkeypatch, force_unload):
+@pytest.mark.parametrize(("output_limit", "expected_limit"), [
+    (None, None), ("", None), ("  ", None), ([""], None),
+    ("32768", 32768), ([32768], 32768), (131072, 131072),
+])
+def test_multitrack_strata_cleans_comfyui_before_request(monkeypatch, force_unload, output_limit, expected_limit):
     module = _load_basic_module()
     events = []
     monkeypatch.setattr(module, "unload_comfyui_models", lambda: events.append("comfy_cleanup"))
 
     class FakeClient:
         def __init__(self, *_args, **_kwargs):
-            pass
+            assert _kwargs["base_url"] == ""
 
         def enhance(self, **kwargs):
             events.append("strata_request")
+            assert kwargs["max_tokens"] == expected_limit
             return types.SimpleNamespace(prompt="enhanced", task_id="", file_ids="")
 
     monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
     output = module.MultiTrackPromptEnhancer.execute(
         system_prompt=["System"], user_prompt=["User"],
-        model=[{"model": module.STRATA_MODEL, "force_unload": force_unload}],
+        model=[{"model": module.STRATA_MODEL, "force_unload": force_unload, "max_tokens": output_limit}],
     )
     assert output.values == ("enhanced", "", "")
     assert events == ["comfy_cleanup", "strata_request"]
+
+
+@pytest.mark.parametrize("output_limit", ["invalid", "32768.5", "0", "-1"])
+def test_multitrack_strata_rejects_invalid_output_limits_before_inference(monkeypatch, output_limit):
+    module = _load_basic_module()
+    monkeypatch.setattr(module, "unload_comfyui_models", lambda: pytest.fail("Invalid request must not unload models"))
+    monkeypatch.setattr(module, "PromptEnhancerClient", lambda *_args, **_kwargs: pytest.fail("Invalid request must not create a client"))
+    with pytest.raises(RuntimeError, match="Prompt enhancement failed"):
+        module.MultiTrackPromptEnhancer.execute(
+            system_prompt=["System"], user_prompt=["User"],
+            model=[{"model": module.STRATA_MODEL, "max_tokens": output_limit}],
+        )
 
 
 def test_multitrack_strata_stops_before_request_when_comfyui_cleanup_fails(monkeypatch):

@@ -6,6 +6,7 @@ import base64
 import binascii
 import io as bytes_io
 import json
+import logging
 import math
 import os
 import re
@@ -26,6 +27,9 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 MINIMAX_MODEL = "h3-context-ir (海螺官方)"
@@ -103,7 +107,6 @@ MODEL_CONFIGS = {
         api_model="strata",
         endpoint=f"{STRATA_BASE_URL}/chat/completions",
         api_key_name="STRATA_API_KEY",
-        default_max_tokens=131072,
         max_tokens_limit=262144,
     ),
     MINIMAX_MODEL: ApiModelConfig(
@@ -639,7 +642,7 @@ class PromptEnhancerClient:
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         config_path: str | os.PathLike[str] | None = None,
-        base_url: str = STRATA_BASE_URL,
+        base_url: str = "",
         temperature: float = 0.7,
         reasoning_effort: str = "none",
         force_unload: bool = True,
@@ -653,7 +656,12 @@ class PromptEnhancerClient:
         self.strata_parameters: dict = {}
         self.force_unload = model == STRATA_MODEL and bool(force_unload)
         if model == STRATA_MODEL:
-            endpoint, self.unload_endpoint = self._strata_endpoints(base_url)
+            selected_base_url = (
+                (base_url or "").strip()
+                or load_config_value("STRATA_BASE_URL", config_path)
+                or STRATA_BASE_URL
+            )
+            endpoint, self.unload_endpoint = self._strata_endpoints(selected_base_url)
             self.config = replace(self.config, endpoint=endpoint)
             if reasoning_effort not in ("none", "low", "medium", "high"):
                 raise ValueError("Strata reasoning_effort must be none, low, medium, or high.")
@@ -711,10 +719,23 @@ class PromptEnhancerClient:
         return f"{api_base}/chat/completions", f"{api_base}/unload?wait=1"
 
     def _strata_completion(self, payload: dict) -> dict:
-        """Release the remote engine after successful or failed inference when requested."""
+        """Fit output to the server's remaining context, then unload when requested."""
         request_error: PromptEnhancerApiError | None = None
         try:
-            return self._request_json("POST", self.config.endpoint, payload)
+            try:
+                return self._request_json("POST", self.config.endpoint, payload)
+            except PromptEnhancerApiError as exc:
+                output_limit = self._strata_context_output_limit(exc, payload.get("max_tokens"))
+                if output_limit is None:
+                    raise
+                LOGGER.warning(
+                    "[Easy Media][Strata] Reducing max_tokens from %s to %s to fit "
+                    "the server's remaining context; retrying once without truncating inputs",
+                    payload["max_tokens"], output_limit,
+                )
+                return self._request_json(
+                    "POST", self.config.endpoint, {**payload, "max_tokens": output_limit},
+                )
         except PromptEnhancerApiError as exc:
             request_error = exc
             raise
@@ -730,6 +751,20 @@ class PromptEnhancerClient:
                     if request_error is not None:
                         message = f"{request_error}; {message}"
                     raise PromptEnhancerApiError(message) from (request_error or exc)
+
+    @staticmethod
+    def _strata_context_output_limit(error: PromptEnhancerApiError, requested: object) -> int | None:
+        """Use only an explicit positive remaining-output limit from Strata's HTTP 400."""
+        if not isinstance(error.__cause__, urllib.error.HTTPError) or error.__cause__.code != 400:
+            return None
+        message = str(error)
+        if "request exceeds the context window:" not in message:
+            return None
+        match = re.search(r"max_tokens \(at most (\d+) here\)", message)
+        if match is None or not isinstance(requested, int):
+            return None
+        output_limit = int(match.group(1))
+        return output_limit if 0 < output_limit < requested else None
 
     @staticmethod
     def _strata_answer_text(content: object) -> str:

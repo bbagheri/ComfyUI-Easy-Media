@@ -7,5 +7,7 @@ BIGMODEL_API_KEY:
 RUNNINGHUB_API_KEY:
 # Optional: only needed when authentication is enabled on the Strata server
 STRATA_API_KEY:
+# Optional: used when the Strata node's base_url is empty; falls back to http://127.0.0.1:8080/v1
+STRATA_BASE_URL:
 # Set ComfyUI url for skill
 COMFYUI_URL:

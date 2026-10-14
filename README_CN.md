@@ -175,9 +175,11 @@ v1.3.0 新增多轨项目流水线，将时间线编排、逐段生成、上下�
 
 ### 本地 Strata 提示词增强
 
-`easy multiTrackPromptEnhancer` 和 `easy multitrackPromptEnhanceToProject` 均支持 **strata (local)**。先单独启动 [Strata](https://github.com/Niko1221/Strata)，再选择该模型。`base_url` 默认 `http://127.0.0.1:8080/v1`，也接受服务根地址或完整 Chat Completions 地址，支持反向代理路径前缀。请求固定使用服务的默认模型（`strata`）。`apikey` 可选，留空时从 `config.yaml` 或环境变量读取 `STRATA_API_KEY`。
+`easy multiTrackPromptEnhancer` 和 `easy multitrackPromptEnhanceToProject` 均支持 **strata (local)**。先单独启动 [Strata](https://github.com/Niko1221/Strata)，再选择该模型。`base_url` 默认留空。地址优先级为：节点非空填写值 → `config.yaml` 中的 `STRATA_BASE_URL` → `http://127.0.0.1:8080/v1`。也接受服务根地址或完整 Chat Completions 地址，支持反向代理路径前缀。已有工作流需要清空之前保存的地址，才会读取配置值。请求固定使用服务的默认模型（`strata`）。`apikey` 可选，留空时从 `config.yaml` 或环境变量读取 `STRATA_API_KEY`。
 
-模型仅保留请求地址、可选密钥、最大令牌数（默认 128K / 131072）、温度、`reasoning_effort` 和 `force_unload` 六项参数。`reasoning_effort=none` 关闭思考（默认）；`low`、`medium`、`high` 开启对应等级的思考。只输出最终回答，独立思考字段、思考内容块和内联 `<think>` 块均不会传入后续提示词；只有思考而没有最终回答时会报错。思考仍占用总输出令牌数。请求超时固定为 600 秒，其余采样设置采用服务默认值。图像输入需要 Strata 开启视觉支持；视频每个最多抽取 24 帧作为图像输入；音频不发送。
+模型仅保留请求地址、可选密钥、最大输出令牌数（默认留空）、温度、`reasoning_effort` 和 `force_unload` 六项参数。`max_tokens` 留空时不发送该字段，使用 Strata 配置的默认值；手动填写正整数时才指定输出上限。`max_tokens` 限制输出（含思考），不是模型的上下文长度；输入与输出之和必须在 Strata 配置的上下文容量内。若手动指定的输出额度超限，且 Strata 明确给出大于零的剩余输出额度，客户端仅将 `max_tokens` 缩小到该额度后重试一次，不裁剪输入。其他错误或输入已无输出空间时仍会报错。已有工作流保留原先保存的输出额度，需要手动修改才会改变。
+
+`reasoning_effort=none` 关闭思考（默认）；`low`、`medium`、`high` 开启对应等级的思考。只输出最终回答，独立思考字段、思考内容块和内联 `<think>` 块均不会传入后续提示词；只有思考而没有最终回答时会报错。思考仍占用总输出令牌数。请求超时固定为 600 秒，其余采样设置采用服务默认值。图像输入需要 Strata 开启视觉支持；视频每个最多抽取 24 帧作为图像输入；音频不发送。
 
 每次 Strata 推理请求前，两个节点都会自动卸载 ComfyUI 已加载的模型、执行垃圾回收并清理加速器显存缓存。即使关闭 `force_unload`，这一步仍会执行；若清理失败，会明确报错并停止发送 Strata 请求。
 

@@ -37,7 +37,6 @@ from ..utils import (
     image_tensor_data_uris,
     LLAMACPP_MODEL,
     STRATA_MODEL,
-    STRATA_BASE_URL,
     MINIMAX_MODEL,
     PROMPT_ENHANCER_MAX_TOKENS,
     PROMPT_ENHANCER_MODELS,
@@ -3507,8 +3506,12 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
     def _strata_inputs() -> list:
         return [
             io.String.Input(
-                "base_url", default=STRATA_BASE_URL,
-                tooltip="Strata server root, /v1 base URL, or full /v1/chat/completions URL. Supports proxy prefixes.",
+                "base_url", default="",
+                tooltip=(
+                    "Optional Strata server root, /v1 base URL, or full Chat Completions URL. "
+                    "Leave empty to read STRATA_BASE_URL from config.yaml, then fall back to "
+                    "http://127.0.0.1:8080/v1. Supports proxy prefixes."
+                ),
             ),
             io.String.Input(
                 "apikey", default="",
@@ -3525,6 +3528,18 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             io.Float.Input(
                 "temperature", default=0.7, min=0.0, max=2.0, step=0.05,
                 tooltip="Sampling temperature; 0 uses greedy decoding.",
+            ),
+            io.MultiType.Input(
+                io.String.Input(
+                    "max_tokens", default="",
+                    tooltip=(
+                        "Optional positive output-token limit, including thinking, not the context window. "
+                        "Leave empty to use Strata's default without sending max_tokens. "
+                        "If an explicit limit exceeds the remaining context, retry once with "
+                        "Strata's reported allowance without truncating inputs."
+                    ),
+                ),
+                types=[io.String, io.Int],
             ),
         ]
 
@@ -3832,9 +3847,19 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
 
         try:
             client_options: dict = {}
+            requested_max_tokens = (
+                None if selected_max_tokens is None
+                else _unwrap_list_scalar(selected_max_tokens, None)
+            )
             if selected_model == STRATA_MODEL:
+                output_limit_text = (
+                    "" if requested_max_tokens is None else str(requested_max_tokens).strip()
+                )
+                requested_max_tokens = int(output_limit_text) if output_limit_text else None
+                if requested_max_tokens is not None and requested_max_tokens <= 0:
+                    raise ValueError("Strata max_tokens must be a positive integer or empty.")
                 client_options = {
-                    "base_url": str(_unwrap_list_scalar(model_config.get("base_url"), STRATA_BASE_URL)),
+                    "base_url": str(_unwrap_list_scalar(model_config.get("base_url"), "")),
                     "temperature": float(_unwrap_list_scalar(model_config.get("temperature"), 0.7)),
                     "reasoning_effort": str(_unwrap_list_scalar(model_config.get("reasoning_effort"), "none")),
                     "force_unload": bool(_unwrap_list_scalar(model_config.get("force_unload"), True)),
@@ -3897,11 +3922,7 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
                 image_urls=image_urls,
                 video_urls=video_urls,
                 audio_urls=audio_urls,
-                max_tokens=(
-                    None
-                    if selected_max_tokens is None
-                    else int(_unwrap_list_scalar(selected_max_tokens, 4096))
-                ),
+                max_tokens=None if requested_max_tokens is None else int(requested_max_tokens),
                 return_async=async_requested,
                 poll_interval=5.0,
                 poll_callback=on_poll,

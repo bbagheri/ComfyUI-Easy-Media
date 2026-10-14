@@ -122,7 +122,7 @@ def test_strata_normalizes_url_and_unloads_without_an_api_key(tmp_path, monkeypa
     assert payload["stream"] is False
     assert payload["reasoning_effort"] == "none"
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["max_tokens"] == 131072
+    assert "max_tokens" not in payload
     assert payload["seed"] == 42
     assert "force_unload" not in payload
 
@@ -152,6 +152,122 @@ def test_strata_sends_custom_parameters_and_images_without_unloading(tmp_path):
         "chat_template_kwargs": {"enable_thinking": True},
     }
     assert any(item["type"] == "image_url" for item in payload["messages"][-1]["content"])
+
+
+def _strata_context_error(module, request, requested, available, status=400):
+    message = (
+        f"request exceeds the context window: prompt (7480 tokens) + max tokens ({requested}) "
+        f"exceeds the context ({7480 + available + 8}); requests are never truncated. "
+        f'Send a smaller max_tokens (at most {available} here), or add "fit_max_tokens": true '
+        "to the model's strata-<model>.json to shorten it to the room left (#545)."
+    )
+    return module.urllib.error.HTTPError(
+        request.full_url, status, "failed", {},
+        io.BytesIO(json.dumps({"error": {"message": message}}).encode()),
+    )
+
+
+@pytest.mark.parametrize("force_unload", [False, True])
+@pytest.mark.parametrize(("requested", "available"), [(131072, 123584), (8192, 2048)])
+def test_strata_retries_explicit_output_limit_without_truncating_inputs(
+    tmp_path, caplog, force_unload, requested, available,
+):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append((request.full_url, json.loads(request.data)))
+        if "/unload" in request.full_url:
+            return _Response({"status": "unloaded"})
+        if len(requests) == 1:
+            raise _strata_context_error(module, request, requested, available)
+        return _Response({"choices": [{"message": {
+            "content": "Final answer", "reasoning_content": "Private thinking",
+        }}]})
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", force_unload=force_unload,
+        config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    result = _enhance_strata(
+        client, max_tokens=requested, task_type="i2v", image_urls=[_png_data_uri()],
+    )
+    assert result.prompt == "Final answer"
+    assert len(requests) == (3 if force_unload else 2)
+    assert requests[1] == (requests[0][0], {**requests[0][1], "max_tokens": available})
+    assert requests[0][1]["max_tokens"] == requested
+    assert f"Reducing max_tokens from {requested} to {available}" in caplog.text
+    if force_unload:
+        assert requests[-1][0].endswith("/v1/unload?wait=1")
+
+
+@pytest.mark.parametrize(("status", "available"), [(500, 2048), (400, 0), (400, 8192), (400, 9000)])
+def test_strata_does_not_retry_without_a_smaller_positive_allowance(tmp_path, status, available):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request.full_url)
+        if "/unload" in request.full_url:
+            return _Response({"status": "unloaded"})
+        raise _strata_context_error(module, request, 8192, available, status=status)
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError):
+        _enhance_strata(client, max_tokens=8192)
+    assert len(requests) == 2
+    assert requests[-1].endswith("/v1/unload?wait=1")
+
+
+@pytest.mark.parametrize("explicit_limit", [None, 8192])
+@pytest.mark.parametrize("message", [
+    "request exceeds the context window: no output space remains",
+    "Invalid temperature; max_tokens (at most 2048 here)",
+])
+def test_strata_does_not_guess_an_output_limit_or_retry_other_errors(tmp_path, explicit_limit, message):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request.full_url)
+        raise module.urllib.error.HTTPError(
+            request.full_url, 400, "failed", {},
+            io.BytesIO(json.dumps({"error": {"message": message}}).encode()),
+        )
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", force_unload=False,
+        config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError):
+        _enhance_strata(client, max_tokens=explicit_limit)
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("retry_failure", ["context", "timeout"])
+def test_strata_context_fit_retries_once_and_unloads_after_retry_failure(tmp_path, retry_failure):
+    module = _load_module()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request.full_url)
+        if "/unload" in request.full_url:
+            return _Response({"status": "unloaded"})
+        if len(requests) == 1:
+            raise _strata_context_error(module, request, 8192, 2048)
+        if retry_failure == "timeout":
+            raise TimeoutError("retry timed out")
+        raise _strata_context_error(module, request, 2048, 1024)
+
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "", config_path=tmp_path / "missing.yaml", opener=opener,
+    )
+    with pytest.raises(module.PromptEnhancerApiError, match="timed out" if retry_failure == "timeout" else "at most 1024"):
+        _enhance_strata(client, max_tokens=8192)
+    assert len(requests) == 3
+    assert requests[-1].endswith("/v1/unload?wait=1")
 
 
 @pytest.mark.parametrize("effort", ["none", "low", "medium", "high"])
@@ -292,6 +408,45 @@ def test_strata_optional_api_key_configuration(tmp_path, monkeypatch, key_source
         monkeypatch.setenv("STRATA_API_KEY", "environment-key")
     client = module.PromptEnhancerClient(module.STRATA_MODEL, "", config_path=config_path)
     assert client.api_key == ("config-key" if key_source == "config" else "environment-key")
+
+
+@pytest.mark.parametrize(("explicit", "configured", "expected_base"), [
+    ("", "https://config.test/proxy/v1", "https://config.test/proxy/v1"),
+    ("  ", " https://config.test/proxy/v1/chat/completions ", "https://config.test/proxy/v1"),
+    (None, "http://config.test:8080", "http://config.test:8080/v1"),
+    (" https://node.test/v1 ", "https://config.test/v1", "https://node.test/v1"),
+    ("https://node.test/v1", "file:///invalid-config-url", "https://node.test/v1"),
+    ("", "", "http://127.0.0.1:8080/v1"),
+    ("", "  ", "http://127.0.0.1:8080/v1"),
+    (None, None, "http://127.0.0.1:8080/v1"),
+])
+def test_strata_address_priority_is_node_config_then_local_default(tmp_path, explicit, configured, expected_base):
+    module = _load_module()
+    config_path = tmp_path / "config.yaml"
+    if configured is not None:
+        config_path.write_text(f"STRATA_BASE_URL: {json.dumps(configured)}\n", encoding="utf-8")
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request.full_url)
+        if "/unload" in request.full_url:
+            return _Response({"status": "unloaded"})
+        return _Response({"choices": [{"message": {"content": "Enhanced"}}]})
+
+    options = {} if explicit is None else {"base_url": explicit}
+    client = module.PromptEnhancerClient(
+        module.STRATA_MODEL, "local-key", config_path=config_path, opener=opener, **options,
+    )
+    assert _enhance_strata(client).prompt == "Enhanced"
+    assert requests == [f"{expected_base}/chat/completions", f"{expected_base}/unload?wait=1"]
+
+
+def test_strata_reports_invalid_configured_address_when_node_address_is_empty(tmp_path):
+    module = _load_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("STRATA_BASE_URL: file:///invalid-config-url\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Strata base_url must be an HTTP or HTTPS URL"):
+        module.PromptEnhancerClient(module.STRATA_MODEL, "local-key", config_path=config_path)
 
 
 @pytest.mark.parametrize(
