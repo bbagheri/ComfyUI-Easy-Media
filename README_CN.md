@@ -179,6 +179,8 @@ v1.3.0 新增多轨项目流水线，将时间线编排、逐段生成、上下�
 
 模型仅保留请求地址、可选密钥、最大令牌数（默认 128K / 131072）、温度、`reasoning_effort` 和 `force_unload` 六项参数。`reasoning_effort=none` 关闭思考（默认）；`low`、`medium`、`high` 开启对应等级的思考。只输出最终回答，独立思考字段、思考内容块和内联 `<think>` 块均不会传入后续提示词；只有思考而没有最终回答时会报错。思考仍占用总输出令牌数。请求超时固定为 600 秒，其余采样设置采用服务默认值。图像输入需要 Strata 开启视觉支持；视频每个最多抽取 24 帧作为图像输入；音频不发送。
 
+每次 Strata 推理请求前，两个节点都会自动卸载 ComfyUI 已加载的模型、执行垃圾回收并清理加速器显存缓存。即使关闭 `force_unload`，这一步仍会执行；若清理失败，会明确报错并停止发送 Strata 请求。
+
 `force_unload` 默认开启，每次推理结束后（包括失败）调用 `/v1/unload?wait=1`，卸载失败会明确报错。下次请求会重新加载模型，连续增强多个项目任务时可关闭以保留模型。Strata 运行在 `base_url` 指向的机器上；`127.0.0.1` 指 ComfyUI 服务所在机器。详见 [Strata 接口说明](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#using-it)。
 
 <a id="multitrack-project"></a>

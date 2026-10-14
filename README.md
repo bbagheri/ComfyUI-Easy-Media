@@ -174,6 +174,8 @@ If an older workflow connects directly to the editor's media outputs, insert `Mu
 
 The six model options are `base_url`, `apikey`, `max_tokens` (default 128K / 131072), `temperature`, `reasoning_effort`, and `force_unload`. `reasoning_effort=none` disables thinking (default); `low`, `medium`, and `high` enable it. Only final answer text is returned: separate reasoning fields, thinking content blocks, and inline `<think>` blocks are excluded. An answer containing only reasoning raises an error instead of forwarding it. Thinking still consumes the total output token budget. Requests have a fixed 600-second timeout; other sampling settings follow the server defaults. Images require Strata's vision support; videos are sampled into up to 24 frames each. Audio is omitted.
 
+Before each Strata inference request, both nodes automatically offload ComfyUI's loaded models, collect garbage, and clear accelerator allocator caches. This also runs when `force_unload` is false. If ComfyUI memory cleanup fails, the Strata request is stopped and the error is reported.
+
 `force_unload` defaults to true and calls `/v1/unload?wait=1` after each inference, including failures. Unload errors are reported. The next request reloads the model. Disable it to keep Strata loaded while enhancing multiple project tasks. Strata runs on the machine named in `base_url`; `127.0.0.1` means the ComfyUI server's machine. See [Strata's API documentation](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#using-it).
 
 <a id="multitrack-project"></a>

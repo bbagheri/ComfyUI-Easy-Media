@@ -87,6 +87,7 @@ def _load_basic_module(monkeypatch):
 
     utils = types.ModuleType("easy_media.utils")
     utils.__path__ = []
+    utils.unload_comfyui_models = lambda: None
     utils.FFMPEG_RESIZE_METHODS = frozenset()
     utils.audio_db_to_gain = lambda value: value
     utils.audio_is_muted = lambda value: False

@@ -222,6 +222,7 @@ def _load_basic_module():
     nodes_package.__path__ = []
     utils_module = types.ModuleType("easy_media.utils")
     utils_module.__path__ = []
+    utils_module.unload_comfyui_models = lambda: None
     utils_module.FFMPEG_RESIZE_METHODS = frozenset({
         "stretch", "resize", "pad", "pad (white)", "crop",
     })
@@ -5259,12 +5260,15 @@ def test_multitrack_prompt_enhancer_returns_user_prompt_unchanged_when_disabled(
 def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(monkeypatch):
     module = _load_basic_module()
     calls = []
+    events = []
+    monkeypatch.setattr(module, "unload_comfyui_models", lambda: events.append("comfy_cleanup"))
 
     class FakeClient:
         def __init__(self, model, api_key, **kwargs):
             calls.append((model, api_key, kwargs))
 
         def enhance(self, **kwargs):
+            events.append("strata_request")
             return types.SimpleNamespace(prompt=f"enhanced-{len(calls)}", task_id="", file_ids="")
 
     monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
@@ -5289,6 +5293,72 @@ def test_multitrack_strata_project_forwards_options_and_writes_final_prompts(mon
     expected_options = {key: value[0] for key, value in options.items() if key not in {"model", "apikey", "max_tokens"}}
     expected_options["timeout"] = 600.0
     assert calls == [(module.STRATA_MODEL, "local-key", expected_options)] * 2
+    assert events == ["comfy_cleanup", "strata_request"] * 2
+
+
+@pytest.mark.parametrize("force_unload", [False, True])
+def test_multitrack_strata_cleans_comfyui_before_request(monkeypatch, force_unload):
+    module = _load_basic_module()
+    events = []
+    monkeypatch.setattr(module, "unload_comfyui_models", lambda: events.append("comfy_cleanup"))
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def enhance(self, **kwargs):
+            events.append("strata_request")
+            return types.SimpleNamespace(prompt="enhanced", task_id="", file_ids="")
+
+    monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
+    output = module.MultiTrackPromptEnhancer.execute(
+        system_prompt=["System"], user_prompt=["User"],
+        model=[{"model": module.STRATA_MODEL, "force_unload": force_unload}],
+    )
+    assert output.values == ("enhanced", "", "")
+    assert events == ["comfy_cleanup", "strata_request"]
+
+
+def test_multitrack_strata_stops_before_request_when_comfyui_cleanup_fails(monkeypatch):
+    module = _load_basic_module()
+
+    def fail_cleanup():
+        raise RuntimeError("Failed to release ComfyUI model memory")
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def enhance(self, **kwargs):
+            pytest.fail("Strata must not be requested after cleanup failure")
+
+    monkeypatch.setattr(module, "unload_comfyui_models", fail_cleanup)
+    monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
+    with pytest.raises(RuntimeError, match="Failed to release ComfyUI model memory"):
+        module.MultiTrackPromptEnhancer.execute(
+            system_prompt=["System"], user_prompt=["User"],
+            model=[{"model": module.STRATA_MODEL}],
+        )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_multitrack_cloud_or_disabled_enhancer_keeps_comfyui_models(monkeypatch, enabled):
+    module = _load_basic_module()
+    monkeypatch.setattr(module, "unload_comfyui_models", lambda: pytest.fail("Unexpected model cleanup"))
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            assert enabled
+
+        def enhance(self, **kwargs):
+            return types.SimpleNamespace(prompt="enhanced", task_id="", file_ids="")
+
+    monkeypatch.setattr(module, "PromptEnhancerClient", FakeClient)
+    output = module.MultiTrackPromptEnhancer.execute(
+        system_prompt=["System"], user_prompt=["User"], enabled=[enabled],
+        model=[{"model": module.PROMPT_ENHANCER_MODELS[1] if enabled else module.STRATA_MODEL}],
+    )
+    assert output.values == ("enhanced" if enabled else "User", "", "")
 
 
 def test_multitrack_prompt_enhance_to_project_resolves_deferred_reference_video(

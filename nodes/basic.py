@@ -64,6 +64,7 @@ from ..utils import (
     resolve_video_path,
     silence,
     trim_audio,
+    unload_comfyui_models,
     video_input_to_local_file,
     video_data_uris,
     write_ass_file,
@@ -3883,6 +3884,9 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
                 process_bar.update_absolute(poll_progress, progress_total)
 
             process_bar.update_absolute(poll_progress, progress_total)
+            if selected_model == STRATA_MODEL:
+                log_node_info("MultiTrack Prompt Enhancer", "Releasing ComfyUI models before Strata inference")
+                unload_comfyui_models()
             result = client.enhance(
                 system_prompt=system_text,
                 user_prompt=user_text,
