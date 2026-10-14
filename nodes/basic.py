@@ -3509,14 +3509,21 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
                 "base_url", default="",
                 tooltip=(
                     "Local OpenAI-compatible Chat Completions server, including Strata. "
-                    "Leave empty to read OPENAI_LOCAL_BASE_URL (or legacy STRATA_BASE_URL) "
-                    "from config.yaml, then fall back to "
-                    "http://127.0.0.1:8080/v1. Supports proxy prefixes."
+                    "Leave empty to read OPENAI_LOCAL_BASE_URL from config.yaml, "
+                    "then fall back to http://127.0.0.1:8080/v1. Supports proxy prefixes."
                 ),
             ),
             io.String.Input(
                 "apikey", default="",
-                tooltip="Optional local API key. Reads OPENAI_LOCAL_API_KEY or legacy STRATA_API_KEY from config.yaml or the environment when empty.",
+                tooltip="Optional local API key. Reads OPENAI_LOCAL_API_KEY from config.yaml or the environment when empty.",
+            ),
+            io.String.Input(
+                "model_name", default="",
+                tooltip=(
+                    "Optional request model name for local OpenAI-compatible services, including Strata. "
+                    "Leave empty to read OPENAI_LOCAL_MODEL_NAME from config.yaml, then discover "
+                    "a single model through /v1/models. Fill explicitly if multiple models are listed."
+                ),
             ),
             io.Boolean.Input(
                 "force_unload", default=False,
@@ -3541,14 +3548,6 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
                     ),
                 ),
                 types=[io.String, io.Int],
-            ),
-            io.String.Input(
-                "model_name", default="",
-                tooltip=(
-                    "Optional request model name for local OpenAI-compatible services, including Strata. "
-                    "Leave empty to read OPENAI_LOCAL_MODEL_NAME from config.yaml, then discover "
-                    "a single model through /v1/models. Fill explicitly if multiple models are listed."
-                ),
             ),
         ]
 

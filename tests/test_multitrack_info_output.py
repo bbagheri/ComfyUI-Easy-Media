@@ -304,7 +304,7 @@ def _load_basic_module():
     utils_module.video_frame_data_uris = lambda values, **kwargs: []
     utils_module.LLAMACPP_MODEL = "llama.cpp (本地)"
     utils_module.OPENAI_COMPATIBLE_MODEL = "openai_compatible (local)"
-    utils_module.STRATA_BASE_URL = "http://127.0.0.1:8080/v1"
+    utils_module.OPENAI_LOCAL_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
     utils_module.MINIMAX_MODEL = "h3-context-ir (海螺官方)"
     utils_module.PROMPT_ENHANCER_MODELS = [
         utils_module.MINIMAX_MODEL,

@@ -96,7 +96,7 @@ def _enhance_strata(client, **kwargs):
 ])
 def test_strata_normalizes_url_and_unloads_without_an_api_key(tmp_path, monkeypatch, base_url):
     module = _load_module()
-    monkeypatch.delenv("STRATA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_LOCAL_API_KEY", raising=False)
     requests = []
 
     def opener(request, timeout):
@@ -401,10 +401,10 @@ def test_strata_optional_api_key_configuration(tmp_path, monkeypatch, key_source
     module = _load_module()
     config_path = tmp_path / "config.yaml"
     if key_source == "config":
-        config_path.write_text("STRATA_API_KEY: config-key\n", encoding="utf-8")
-        monkeypatch.setenv("STRATA_API_KEY", "ignored-key")
+        config_path.write_text("OPENAI_LOCAL_API_KEY: config-key\n", encoding="utf-8")
+        monkeypatch.setenv("OPENAI_LOCAL_API_KEY", "ignored-key")
     else:
-        monkeypatch.setenv("STRATA_API_KEY", "environment-key")
+        monkeypatch.setenv("OPENAI_LOCAL_API_KEY", "environment-key")
     client = module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "", model_name="strata", config_path=config_path)
     assert client.api_key == ("config-key" if key_source == "config" else "environment-key")
 
@@ -423,7 +423,7 @@ def test_strata_address_priority_is_node_config_then_local_default(tmp_path, exp
     module = _load_module()
     config_path = tmp_path / "config.yaml"
     if configured is not None:
-        config_path.write_text(f"STRATA_BASE_URL: {json.dumps(configured)}\n", encoding="utf-8")
+        config_path.write_text(f"OPENAI_LOCAL_BASE_URL: {json.dumps(configured)}\n", encoding="utf-8")
     requests = []
 
     def opener(request, timeout):
@@ -443,7 +443,7 @@ def test_strata_address_priority_is_node_config_then_local_default(tmp_path, exp
 def test_strata_reports_invalid_configured_address_when_node_address_is_empty(tmp_path):
     module = _load_module()
     config_path = tmp_path / "config.yaml"
-    config_path.write_text("STRATA_BASE_URL: file:///invalid-config-url\n", encoding="utf-8")
+    config_path.write_text("OPENAI_LOCAL_BASE_URL: file:///invalid-config-url\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Local base_url must be an HTTP or HTTPS URL"):
         module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "local-key", model_name="strata", config_path=config_path)
 
@@ -543,15 +543,30 @@ def test_local_configuration_overrides_legacy_strata_configuration(tmp_path, mon
     module = _load_module()
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "OPENAI_LOCAL_BASE_URL: https://local.test/v1\nSTRATA_BASE_URL: https://legacy.test/v1\n"
-        "OPENAI_LOCAL_API_KEY: local-key\nSTRATA_API_KEY: legacy-key\n"
-        "OPENAI_LOCAL_MODEL_NAME: configured-model\n", encoding="utf-8",
+        "OPENAI_LOCAL_BASE_URL: https://local.test/v1\n"
+        "OPENAI_LOCAL_API_KEY: local-key\n"
+        "OPENAI_LOCAL_MODEL_NAME: configured-model\n"
+        "STRATA_BASE_URL: https://legacy.test/v1\nSTRATA_API_KEY: legacy-key\n", encoding="utf-8",
     )
     monkeypatch.setenv("OPENAI_LOCAL_API_KEY", "environment-key")
+    monkeypatch.setenv("STRATA_API_KEY", "legacy-environment-key")
     client = module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "", config_path=config_path)
     assert client.config.endpoint == "https://local.test/v1/chat/completions"
     assert client.config.api_model == "configured-model"
     assert client.api_key == "local-key"
+
+
+def test_legacy_strata_configuration_is_ignored(tmp_path, monkeypatch):
+    module = _load_module()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "STRATA_BASE_URL: https://legacy.test/v1\nSTRATA_API_KEY: legacy-key\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("STRATA_BASE_URL", "https://legacy.test/v1")
+    monkeypatch.setenv("STRATA_API_KEY", "legacy-environment-key")
+    client = module.PromptEnhancerClient(module.OPENAI_COMPATIBLE_MODEL, "", config_path=config_path)
+    assert client.config.endpoint == f"{module.OPENAI_LOCAL_DEFAULT_BASE_URL}/chat/completions"
+    assert client.api_key == ""
 
 
 def test_legacy_strata_provider_name_remains_accepted_by_client(tmp_path):

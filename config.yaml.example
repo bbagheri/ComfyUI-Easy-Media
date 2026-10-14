@@ -7,11 +7,8 @@ BIGMODEL_API_KEY:
 RUNNINGHUB_API_KEY:
 # Local OpenAI-compatible Chat Completions service (including Strata)
 OPENAI_LOCAL_API_KEY:
+# Optional: used when the node's base_url is empty; falls back to http://127.0.0.1:8080/v1
 OPENAI_LOCAL_BASE_URL:
 OPENAI_LOCAL_MODEL_NAME:
-# Legacy Strata keys are still read when the corresponding local key is empty
-STRATA_API_KEY:
-# Optional: used when the Strata node's base_url is empty; falls back to http://127.0.0.1:8080/v1
-STRATA_BASE_URL:
 # Set ComfyUI url for skill
 COMFYUI_URL:

@@ -177,7 +177,7 @@ v1.3.0 新增多轨项目流水线，将时间线编排、逐段生成、上下�
 
 `easy multiTrackPromptEnhancer` 和 `easy multitrackPromptEnhanceToProject` 支持 **openai_compatible (local)**，使用 `/v1/chat/completions`，包括 [Strata](https://github.com/Niko1221/Strata)。保留七项参数：`base_url`、`model_name`、`apikey`、`max_tokens`、`temperature`、`reasoning_effort`、`force_unload`。
 
-`base_url` 默认留空，优先级为节点非空值 → `config.yaml` 的 `OPENAI_LOCAL_BASE_URL` → 旧配置 `STRATA_BASE_URL` → `http://127.0.0.1:8080/v1`。接受服务根地址、`/v1` 地址、完整 Chat Completions 地址及代理路径前缀。`model_name` 也默认留空：节点填写值优先于 `OPENAI_LOCAL_MODEL_NAME` 配置，否则通过 `/v1/models` 发现唯一模型，同一模型的别名也可识别。服务不支持模型发现，或存在多个不同模型时，需要填写模型名。密钥可选，读取配置或环境变量的 `OPENAI_LOCAL_API_KEY`，并兼容 `STRATA_API_KEY`。
+`base_url` 默认留空，优先级为节点非空值 → `config.yaml` 的 `OPENAI_LOCAL_BASE_URL` → `http://127.0.0.1:8080/v1`。接受服务根地址、`/v1` 地址、完整 Chat Completions 地址及代理路径前缀。`model_name` 也默认留空：节点填写值优先于 `OPENAI_LOCAL_MODEL_NAME` 配置，否则通过 `/v1/models` 发现唯一模型，同一模型的别名也可识别。服务不支持模型发现，或存在多个不同模型时，需要填写模型名。密钥可选，读取配置或环境变量的 `OPENAI_LOCAL_API_KEY`。
 
 `max_tokens` 默认留空，不发送该字段，使用服务默认输出额度；支持正整数及 STRING/INT 连接。输出包括思考，与输入之和须在服务的上下文容量内。手动额度超限且服务返回 Strata 格式的正数剩余额度时，会仅缩小输出并重试一次，不裁剪输入；其他错误及已无输出空间时仍报错。已有工作流会保留保存的值，需要重新选择新服务选项、清空旧地址或额度才会采用默认行为。
 

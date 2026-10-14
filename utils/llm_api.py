@@ -40,14 +40,14 @@ RUNNINGHUB_GLM_MODEL = "glm-5v-turbo (RunningHub)"
 LLAMACPP_MODEL = "llama.cpp (本地)"
 OPENAI_COMPATIBLE_MODEL = "openai_compatible (local)"
 STRATA_MODEL = "strata (local)"
-STRATA_BASE_URL = "http://127.0.0.1:8080/v1"
+OPENAI_LOCAL_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 
 __all__ = [
     "ApiModelConfig",
     "LLAMACPP_MODEL",
     "OPENAI_COMPATIBLE_MODEL",
+    "OPENAI_LOCAL_DEFAULT_BASE_URL",
     "STRATA_MODEL",
-    "STRATA_BASE_URL",
     "MINIMAX_MODEL",
     "MODEL_CONFIGS",
     "PROMPT_ENHANCER_MAX_TOKENS",
@@ -107,9 +107,8 @@ MODEL_CONFIGS = {
     OPENAI_COMPATIBLE_MODEL: ApiModelConfig(
         provider="openai_local",
         api_model="",
-        endpoint=f"{STRATA_BASE_URL}/chat/completions",
+        endpoint=f"{OPENAI_LOCAL_DEFAULT_BASE_URL}/chat/completions",
         api_key_name="OPENAI_LOCAL_API_KEY",
-        legacy_env_names=("STRATA_API_KEY",),
     ),
     MINIMAX_MODEL: ApiModelConfig(
         provider="minimax",
@@ -664,8 +663,7 @@ class PromptEnhancerClient:
             selected_base_url = (
                 (base_url or "").strip()
                 or load_config_value("OPENAI_LOCAL_BASE_URL", config_path)
-                or load_config_value("STRATA_BASE_URL", config_path)
-                or STRATA_BASE_URL
+                or OPENAI_LOCAL_DEFAULT_BASE_URL
             )
             endpoint, self.unload_endpoint = self._local_endpoints(selected_base_url)
             selected_model_name = (model_name or "").strip() or load_config_value("OPENAI_LOCAL_MODEL_NAME", config_path)
@@ -686,8 +684,6 @@ class PromptEnhancerClient:
             if not explicit_api_key
             else ""
         )
-        if not explicit_api_key and not config_api_key and self.config.provider == "openai_local":
-            config_api_key = load_api_key_from_config("STRATA_API_KEY", config_path)
         environment_api_key = ""
         if not explicit_api_key and not config_api_key:
             for environment_name in (
