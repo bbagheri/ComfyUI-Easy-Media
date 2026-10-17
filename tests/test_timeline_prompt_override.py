@@ -87,6 +87,7 @@ def _load_basic_module(monkeypatch):
 
     utils = types.ModuleType("easy_media.utils")
     utils.__path__ = []
+    utils.unload_comfyui_models = lambda: None
     utils.FFMPEG_RESIZE_METHODS = frozenset()
     utils.audio_db_to_gain = lambda value: value
     utils.audio_is_muted = lambda value: False
@@ -127,6 +128,8 @@ def _load_basic_module(monkeypatch):
     utils.video_data_uris = lambda values: []
     utils.video_frame_data_uris = lambda values, **kwargs: []
     utils.LLAMACPP_MODEL = "llama.cpp (本地)"
+    utils.OPENAI_COMPATIBLE_MODEL = "openai_compatible (local)"
+    utils.OPENAI_LOCAL_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
     utils.MINIMAX_MODEL = "h3-context-ir (海螺官方)"
     utils.PROMPT_ENHANCER_MODELS = [utils.MINIMAX_MODEL]
     utils.PROMPT_ENHANCER_MAX_TOKENS = {}

@@ -168,6 +168,18 @@ If an older workflow connects directly to the editor's media outputs, insert `Mu
 
 > **Note:** Some models support automatic download via the built-in Easy-Media model download interface. Model files will be placed in the `ComfyUI/models/` directory.
 
+### Local OpenAI-compatible Prompt Enhancement
+
+`easy multiTrackPromptEnhancer` and `easy multitrackPromptEnhanceToProject` support **openai_compatible (local)** through `/v1/chat/completions`, including [Strata](https://github.com/Niko1221/Strata). The seven options are `base_url`, `model_name`, `apikey`, `max_tokens`, `temperature`, `reasoning_effort`, and `force_unload`.
+
+`base_url` is empty by default: a nonempty node value takes priority, followed by `OPENAI_LOCAL_BASE_URL` in `config.yaml` and finally `http://127.0.0.1:8080/v1`. Server roots, `/v1` bases, full Chat Completions URLs, and proxy prefixes are accepted. `model_name` is also empty by default: the node value overrides `OPENAI_LOCAL_MODEL_NAME`; otherwise `/v1/models` must identify one model (aliases for that same model are accepted). If discovery is unavailable or multiple distinct models are listed, fill `model_name` explicitly. API keys are optional and read from `OPENAI_LOCAL_API_KEY` in config.yaml or the environment.
+
+`max_tokens` defaults to empty and is omitted from the request, leaving the output limit to the service. Positive integers and STRING/INT connections are supported. Output includes thinking and must fit beside the input in the server's context. An explicit output limit rejected with Strata's positive remaining-output allowance is reduced to that allowance and retried once without truncating input. Other errors and inputs with no output space still fail. Existing workflows keep saved field values; select the new provider and clear saved limits or addresses to use the defaults.
+
+`reasoning_effort` defaults to `high`; `none`, `low`, `medium`, and `high` are sent directly, without `enable_thinking` or `chat_template_kwargs`. The service must support the selected effort; Strata's `none` disables thinking. Only final answer text is returned: separate reasoning fields, thinking content blocks, and inline `<think>` blocks are excluded. Reasoning-only responses fail. Temperature defaults to 0.7, timeout is 600 seconds, and other settings follow the service defaults. Vision-capable models receive images; each video is sampled into up to 24 image frames. Audio is omitted.
+
+Both nodes offload ComfyUI's loaded models and clear allocator caches before local inference; cleanup failures stop the request. `force_unload` defaults to **false**. When enabled, it separately calls `/v1/unload?wait=1` after inference, including failures. Enable it for Strata or services that implement that endpoint; keep it disabled otherwise. Unload errors are reported. The generated Chat Completions payload does not contain `force_unload`. Strata runs on the machine selected by `base_url`; `127.0.0.1` means the ComfyUI server's machine. See [Strata's API documentation](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#using-it).
+
 <a id="multitrack-project"></a>
 
 ### 🎞️ MultiTrack Project

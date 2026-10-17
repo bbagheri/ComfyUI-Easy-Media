@@ -40,6 +40,21 @@ describe('prompt enhancer API account management', () => {
     expect(minimax.apiKeyPageUrl).toBeTruthy()
   })
 
+  it.each([PROMPT_ENHANCER_MODELS.compatibleLocal, PROMPT_ENHANCER_MODELS.strata])('shows %s without cloud account controls or balance requests', (modelName) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    expect(getPromptEnhancerAccountProvider(modelName).id).toBe('local')
+    render(
+      <PromptEnhancerAccountBar
+        apiKey=""
+        locale="zh-CN"
+        modelName={modelName}
+      />,
+    )
+    expect(screen.getByText('本地模型，无需 API 账户')).not.toBeNull()
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('reads the selected dynamic-combo model and API key widgets', () => {
     expect(readPromptEnhancerAccountSelection({
       widgets: [

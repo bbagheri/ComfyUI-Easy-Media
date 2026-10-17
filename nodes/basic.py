@@ -36,6 +36,7 @@ from ..utils import (
     audio_data_uris,
     image_tensor_data_uris,
     LLAMACPP_MODEL,
+    OPENAI_COMPATIBLE_MODEL,
     MINIMAX_MODEL,
     PROMPT_ENHANCER_MAX_TOKENS,
     PROMPT_ENHANCER_MODELS,
@@ -62,6 +63,7 @@ from ..utils import (
     resolve_video_path,
     silence,
     trim_audio,
+    unload_comfyui_models,
     video_input_to_local_file,
     video_data_uris,
     write_ass_file,
@@ -3429,7 +3431,9 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
         options: list = []
         for model_name in PROMPT_ENHANCER_MODELS:
             inputs: list = []
-            if model_name != LLAMACPP_MODEL:
+            if model_name == OPENAI_COMPATIBLE_MODEL:
+                inputs.extend(cls._local_openai_inputs())
+            elif model_name != LLAMACPP_MODEL:
                 inputs.append(cls._api_key_input())
             if model_name == MINIMAX_MODEL:
                 inputs.extend(
@@ -3498,6 +3502,55 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             options.append(io.DynamicCombo.Option(model_name, inputs))
         return options
 
+    @staticmethod
+    def _local_openai_inputs() -> list:
+        return [
+            io.String.Input(
+                "base_url", default="",
+                tooltip=(
+                    "Local OpenAI-compatible Chat Completions server, including Strata. "
+                    "Leave empty to read OPENAI_LOCAL_BASE_URL from config.yaml, "
+                    "then fall back to http://127.0.0.1:8080/v1. Supports proxy prefixes."
+                ),
+            ),
+            io.String.Input(
+                "apikey", default="",
+                tooltip="Optional local API key. Reads OPENAI_LOCAL_API_KEY from config.yaml or the environment when empty.",
+            ),
+            io.String.Input(
+                "model_name", default="",
+                tooltip=(
+                    "Optional request model name for local OpenAI-compatible services, including Strata. "
+                    "Leave empty to read OPENAI_LOCAL_MODEL_NAME from config.yaml, then discover "
+                    "a single model through /v1/models. Fill explicitly if multiple models are listed."
+                ),
+            ),
+            io.Boolean.Input(
+                "force_unload", default=False,
+                tooltip="After inference, call /v1/unload?wait=1 separately to release the service model. Enable for Strata or services supporting this endpoint; keep disabled for other compatible services.",
+            ),
+            io.Combo.Input(
+                "reasoning_effort", options=["none", "low", "medium", "high"], default="high",
+                tooltip="Reasoning effort sent to the local service; high by default. Strata supports none to disable thinking. Only the final answer is returned; thinking consumes output tokens.",
+            ),
+            io.Float.Input(
+                "temperature", default=0.7, min=0.0, max=2.0, step=0.05,
+                tooltip="Sampling temperature; 0 uses greedy decoding.",
+            ),
+            io.MultiType.Input(
+                io.String.Input(
+                    "max_tokens", default="",
+                    tooltip=(
+                        "Optional positive output-token limit, including thinking, not the context window. "
+                        "Leave empty to use the service default without sending max_tokens. "
+                        "If an explicit limit exceeds the remaining context, retry once with "
+                        "Strata's reported allowance without truncating inputs."
+                    ),
+                ),
+                types=[io.String, io.Int],
+            ),
+        ]
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
@@ -3506,7 +3559,7 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             category=CATEGORY_MULTITRACK,
             description=(
                 "Use MiniMax H3-Context-IR, a configured third-party multimodal LLM, "
-                "or a local llama.cpp model to enhance a multitrack video prompt."
+                "or a local llama.cpp / OpenAI-compatible model (including Strata) to enhance a multitrack video prompt."
             ),
             is_input_list=True,
             not_idempotent=True,
@@ -3659,6 +3712,8 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
         selected_model = str(
             _unwrap_list_scalar(model_config.get("model"), MINIMAX_MODEL)
         )
+        if selected_model == "strata (local)":
+            selected_model = OPENAI_COMPATIBLE_MODEL
         selected_api_key = str(
             _unwrap_list_scalar(model_config.get("apikey"), "")
         )
@@ -3801,9 +3856,30 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
             )
 
         try:
+            client_options: dict = {}
+            requested_max_tokens = (
+                None if selected_max_tokens is None
+                else _unwrap_list_scalar(selected_max_tokens, None)
+            )
+            if selected_model == OPENAI_COMPATIBLE_MODEL:
+                output_limit_text = (
+                    "" if requested_max_tokens is None else str(requested_max_tokens).strip()
+                )
+                requested_max_tokens = int(output_limit_text) if output_limit_text else None
+                if requested_max_tokens is not None and requested_max_tokens <= 0:
+                    raise ValueError("Local max_tokens must be a positive integer or empty.")
+                client_options = {
+                    "base_url": str(_unwrap_list_scalar(model_config.get("base_url"), "")),
+                    "model_name": str(_unwrap_list_scalar(model_config.get("model_name"), "")),
+                    "temperature": float(_unwrap_list_scalar(model_config.get("temperature"), 0.7)),
+                    "reasoning_effort": str(_unwrap_list_scalar(model_config.get("reasoning_effort"), "high")),
+                    "force_unload": bool(_unwrap_list_scalar(model_config.get("force_unload"), False)),
+                    "timeout": 600.0,
+                }
             client = PromptEnhancerClient(
                 selected_model,
                 selected_api_key,
+                **client_options,
             )
             is_minimax = selected_model == MINIMAX_MODEL
             image_urls = image_tensor_data_uris(
@@ -3844,6 +3920,9 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
                 process_bar.update_absolute(poll_progress, progress_total)
 
             process_bar.update_absolute(poll_progress, progress_total)
+            if selected_model == OPENAI_COMPATIBLE_MODEL:
+                log_node_info("MultiTrack Prompt Enhancer", "Releasing ComfyUI models before local OpenAI-compatible inference")
+                unload_comfyui_models()
             result = client.enhance(
                 system_prompt=system_text,
                 user_prompt=user_text,
@@ -3854,11 +3933,7 @@ class MultiTrackPromptEnhancer(io.ComfyNode):
                 image_urls=image_urls,
                 video_urls=video_urls,
                 audio_urls=audio_urls,
-                max_tokens=(
-                    None
-                    if selected_max_tokens is None
-                    else int(_unwrap_list_scalar(selected_max_tokens, 4096))
-                ),
+                max_tokens=None if requested_max_tokens is None else int(requested_max_tokens),
                 return_async=async_requested,
                 poll_interval=5.0,
                 poll_callback=on_poll,

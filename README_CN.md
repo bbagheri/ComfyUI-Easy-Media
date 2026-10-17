@@ -173,6 +173,18 @@ v1.3.0 新增多轨项目流水线，将时间线编排、逐段生成、上下�
 > **提示：** 部分模型支持通过 Easy-Media 内置的模型下载接口自动下载，模型文件将放置在 `ComfyUI/models/` 目录下。
 
 
+### 本地 OpenAI 兼容提示词增强
+
+`easy multiTrackPromptEnhancer` 和 `easy multitrackPromptEnhanceToProject` 支持 **openai_compatible (local)**，使用 `/v1/chat/completions`，包括 [Strata](https://github.com/Niko1221/Strata)。保留七项参数：`base_url`、`model_name`、`apikey`、`max_tokens`、`temperature`、`reasoning_effort`、`force_unload`。
+
+`base_url` 默认留空，优先级为节点非空值 → `config.yaml` 的 `OPENAI_LOCAL_BASE_URL` → `http://127.0.0.1:8080/v1`。接受服务根地址、`/v1` 地址、完整 Chat Completions 地址及代理路径前缀。`model_name` 也默认留空：节点填写值优先于 `OPENAI_LOCAL_MODEL_NAME` 配置，否则通过 `/v1/models` 发现唯一模型，同一模型的别名也可识别。服务不支持模型发现，或存在多个不同模型时，需要填写模型名。密钥可选，读取配置或环境变量的 `OPENAI_LOCAL_API_KEY`。
+
+`max_tokens` 默认留空，不发送该字段，使用服务默认输出额度；支持正整数及 STRING/INT 连接。输出包括思考，与输入之和须在服务的上下文容量内。手动额度超限且服务返回 Strata 格式的正数剩余额度时，会仅缩小输出并重试一次，不裁剪输入；其他错误及已无输出空间时仍报错。已有工作流会保留保存的值，需要重新选择新服务选项、清空旧地址或额度才会采用默认行为。
+
+`reasoning_effort` 默认 **high**；直接发送 `none`、`low`、`medium` 或 `high`，不额外发送 `enable_thinking` 或 `chat_template_kwargs`。服务需支持所选等级，Strata 的 `none` 表示关闭思考。只返回最终回答，独立思考字段、思考内容块及内联 `<think>` 块均过滤，只有思考的响应会报错。温度默认 0.7，超时固定 600 秒，其余设置采用服务默认值。支持视觉的模型可接收图像；视频每个最多抽取 24 帧作为图像发送；音频不发送。
+
+两个节点请求本地模型前会卸载 ComfyUI 已加载模型并清理显存缓存，清理失败时停止请求。`force_unload` 默认 **关闭**；开启后，在推理结束时（包括失败）单独调用 `/v1/unload?wait=1` 释放服务模型。适用于 Strata 等支持该接口的服务，其他服务请保持关闭；卸载失败会明确报错。生成请求正文不包含 `force_unload`。Strata 运行在 `base_url` 指向的机器上，`127.0.0.1` 指 ComfyUI 服务所在机器。详见 [Strata 接口说明](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#using-it)。
+
 <a id="multitrack-project"></a>
 
 ### 🎞️ 多轨项目 MultiTrack Project
