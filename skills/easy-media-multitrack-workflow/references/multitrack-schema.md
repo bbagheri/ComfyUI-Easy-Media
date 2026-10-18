@@ -144,14 +144,14 @@ custom 示例：
 
 `source_type` 可为 `input`、`output`、`local`、`url` 或 `slot`。字段必须与来源匹配：input/output 用 `file_path`，local 用 `local_path`，url 用 `url`，slot 用 `slot_name`。不要把本机绝对路径标成 `input`。
 
-上下文分段需要反复使用同一张参考图时，可在图片项上设置 `"shared_reference": true`。该图片会成为公用图片，自动排在每个任务片段的私有图片之前；公用和私有图片合计仍不得超过 9 张。不要为了共享而在每个任务中手工复制相同图片。
+上下文分段需要反复使用同一张参考图时，可在图片项上设置 `"shared_reference": true`。该图片会成为公用图片，自动排在每个任务片段的私有图片之前；公用和私有图片合计仍不得超过 9 张。当前前端的 `synchronizeSharedTaskImages` 会在后续任务缺少公用图片元数据时生成新 UUID，因此多次归一化相同稀疏原始数据会得到不同 ID；仅凭此代码不能确认 React maximum update depth 或 widget 卸载的完整触发链。未验证目标前端能稳定加载此类数据时，每个任务显式保存私有图片项（`shared_reference: false`）及固定 ID，指向同一已上传文件即可，无需复制或重新上传文件。切换 continuity 模式本身不能修复这个问题。
 
 ## 上下文漂移控制模式
 
 `context_drift` 是“上下文漂移控制”衔接模式：沿用前一段的场景和运动上下文，同时允许模型根据参考视频替换主体、人物、物体或局部区域。用户提供视频作为主体替换、人物替换、物体替换、服装/脸部等局部替换参考时，按以下规则编排：
 
 - 将本次范围内所有 task segment 的 `content.continuity_mode` 设为 `context_drift`；不要只修改第二段或后续片段。首段虽然没有前序生成上下文，也保持同一模式，以便项目元数据和后续重生成一致。
-- 参考视频放在 video track，并覆盖全部目标 task segment 的时间范围。若它还需要跨任务作为模型参考，在视频片段 `content` 上设置 `shared_reference: true`。
+- 参考视频放在 video track，并覆盖需要动作参考的目标 task segment；若工程还有不依赖舞蹈视频的主歌等段落，保留同一完整工程，由完整锁定音频覆盖全部任务，视频只覆盖对应部分。若它还需要跨任务作为模型参考，在视频片段 `content` 上设置 `shared_reference: true`。
 - 在该 video track 设置轨道级 `audio_locked: true`，让源视频时间驱动生成；同时只把其他 video track 的 `audio_locked` 显式设为 `false`。若要替换原声，可另锁定一条 audio track，后者会优先作为音频来源。仅沿用视频原声时，锁定前确认视频包含可用音轨并覆盖全部目标 task segment。
 - 用户明确指定片段长度或边界时以用户要求为准。否则按连续 10 秒拆分 task segment：每段帧数为 `round(10 * frame_rate)`，最后一段使用参考视频的剩余帧，不补齐、不丢弃余数，也不创建空末段。参考视频本身可保留为覆盖完整范围的单个 video segment，无需为每个 task segment 重复复制。
 - 用户明确要求去掉、替换或不保留参考视频原声时，不自动锁定该 video track，并按用户指定的音频方案处理。
@@ -215,6 +215,8 @@ custom 示例：
   ]
 }
 ```
+
+完整锁定 audio track 可与局部锁定 video track 并存。运行时在当前任务与视频没有交集时不传入视频，仍使用主音频；不要因为部分任务没有视频参考就拆工程或拉伸视频。校验仅在锁定音频连续覆盖选定任务时放行局部视频锁（允许多个首尾相接的音频片段）；没有完整主音频时仍检查锁定媒体与各任务的交集。
 
 同一个 TrackData 最多可有一条 `audio_locked: true` 的 audio track 和一条 `audio_locked: true` 的 video track。切换同类型锁定来源时，应把该类型的其他轨道显式设为 `false`，不要清除另一种类型的锁。不要把 `audio_locked` 写进媒体片段的 `content`；旧版片段级字段仅用于兼容迁移。
 
