@@ -6374,7 +6374,11 @@ def test_multitrack_h3_bridge_segment_wires_incoming_context_and_outgoing_constr
             "id": "seg-2",
             "start_frame": 240,
             "end_frame": 360,
-            "content": {"task_mode": "default", "continuity_mode": "context", "images": []},
+            "content": {
+                "task_mode": "default",
+                "continuity_mode": "context",
+                "images": [{"media_index": 0}],
+            },
         },
     ]
 
@@ -6393,6 +6397,7 @@ def test_multitrack_h3_bridge_segment_wires_incoming_context_and_outgoing_constr
     ]
     assert len(head_loads) == 1
     assert head_loads[0]["inputs"]["segment_index"] == 1
+    assert head_loads[0]["inputs"]["prefer_rendered_video"] is False
     assert head_loads[0]["inputs"]["allow_timeline_fallback"] is True
 
     outgoing = [
@@ -6402,4 +6407,78 @@ def test_multitrack_h3_bridge_segment_wires_incoming_context_and_outgoing_constr
     ]
     assert len(outgoing) == 1
     assert outgoing[0]["inputs"]["is_second_pass"] is False
+
+
+def test_multitrack_h3_autoregressive_run_never_adds_outgoing_constraints_when_old_videos_exist(
+    monkeypatch, tmp_path
+):
+    module = _load_minimax_node(monkeypatch)
+    monkeypatch.setattr(
+        module.folder_paths,
+        "get_output_directory",
+        lambda: str(tmp_path),
+    )
+    project_dir = _write_context_project(tmp_path)
+    (project_dir / "video_1_1.mp4").write_bytes(b"old-seg1-video")
+    (project_dir / "video_2_1.mp4").write_bytes(b"old-seg2-video")
+    manifest_path = project_dir / "project.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["segments"]["1"] = {
+        "active_generation": 1,
+        "generations": {"1": {"video": "video_1_1.mp4"}},
+    }
+    manifest["segments"]["2"] = {
+        "active_generation": 1,
+        "generations": {"1": {"video": "video_2_1.mp4"}},
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    info = _h3_project_inputs()["tracks_info"][0]
+    info["tracks"][0]["segments"] = [
+        {
+            "id": "seg-0",
+            "start_frame": 0,
+            "end_frame": 120,
+            "content": {"task_mode": "default", "continuity_mode": "shot", "images": []},
+        },
+        {
+            "id": "seg-1",
+            "start_frame": 120,
+            "end_frame": 240,
+            "content": {"task_mode": "default", "continuity_mode": "context_drift", "images": []},
+        },
+        {
+            "id": "seg-2",
+            "start_frame": 240,
+            "end_frame": 360,
+            "content": {"task_mode": "default", "continuity_mode": "context", "images": []},
+        },
+    ]
+
+    for first_pass_only in (False, True):
+        result = module.EasyMultiTrackProject.execute(
+            **_h3_project_inputs(
+                project_name="demo",
+                project_save=["new"],
+                tracks_info=[info],
+                segment_start_number=[1],
+                segment_count=[-1],
+                sampling_mode=_h3_sampling_mode(
+                    "dual",
+                    upscale_by=[1.25],
+                    **{"1st_pass_only": [first_pass_only]},
+                ),
+                end_constraint_mode=["auto_when_next_exists"],
+                end_constraint_strength=[0.75],
+            )
+        )
+        nodes = list(result.expand.values())
+        assert not any(
+            node["class_type"] in {
+                "easy h3ProjectNextSegmentHeadLoad",
+                "easy minimaxH3OutgoingConstraint",
+            }
+            for node in nodes
+        )
+
 

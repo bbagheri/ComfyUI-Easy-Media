@@ -1144,7 +1144,7 @@ def test_resolve_h3_next_segment_head_media_uses_timeline_fallback_for_bridge(tm
         "height": 64,
         "frame_rate": 24,
         "format": "MiniMax",
-        "_preloaded_media": {
+        "media": {
             "images": [next_ref_image],
             "audio": [],
             "video": [],
@@ -1166,7 +1166,7 @@ def test_resolve_h3_next_segment_head_media_uses_timeline_fallback_for_bridge(tm
                         "content": {
                             "task_mode": "default",
                             "continuity_mode": "context_drift",
-                            "images": [{"media_index": 0}],
+                            "images": [{"slot_name": "image_1"}],
                         },
                     },
                 ],
@@ -1174,16 +1174,93 @@ def test_resolve_h3_next_segment_head_media_uses_timeline_fallback_for_bridge(tm
         ],
     }
     initialize_h3_project("bridge_fallback", info, tmp_path)
-    images, audio = resolve_h3_next_segment_head_media(
+    images, audio, source_label = resolve_h3_next_segment_head_media(
         "bridge_fallback",
         0,
-        tmp_path,
         tracks_info=info,
         allow_timeline_fallback=True,
         head_frames=5,
+        output_directory=tmp_path,
+        degrain_strength=0.0,
     )
     assert images is not None
-    assert tuple(images.shape) == (5, 64, 64, 3)
-    assert torch.allclose(images, next_ref_image.repeat(5, 1, 1, 1))
+    assert tuple(images.shape) == (1, 64, 64, 3)
+    assert torch.allclose(images, next_ref_image)
     assert audio is None
+    assert source_label == "next_segment_image:1"
+
+
+def test_initialize_h3_project_shifts_legacy_manifest_without_task_ids_when_bridge_spliced(tmp_path):
+    project_dir = tmp_path / "easy_media" / "projects" / "legacy_splice"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "video_0_1.mp4").write_bytes(b"video-0")
+    (project_dir / "video_1_1.mp4").write_bytes(b"video-1")
+    manifest_path = project_dir / "project.json"
+    # Legacy manifest: has task_segments of length 2, but no task_ids key
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "project_name": "legacy_splice",
+                "width": 1280,
+                "height": 720,
+                "fps": 24.0,
+                "task_segments": [
+                    {"start_frame": 0, "end_frame": 120, "continuity_mode": "shot"},
+                    {"start_frame": 120, "end_frame": 240, "continuity_mode": "context"},
+                ],
+                "segments": {
+                    "0": {
+                        "active_generation": 1,
+                        "generations": {"1": {"video": "video_0_1.mp4"}},
+                    },
+                    "1": {
+                        "active_generation": 1,
+                        "generations": {"1": {"video": "video_1_1.mp4"}},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    spliced_info = {
+        "width": 1280,
+        "height": 720,
+        "frame_rate": 24,
+        "format": "MiniMax",
+        "tracks": [
+            {
+                "type": "task",
+                "segments": [
+                    {
+                        "id": "seg-0",
+                        "start_frame": 0,
+                        "end_frame": 120,
+                        "content": {"task_mode": "default", "continuity_mode": "shot"},
+                    },
+                    {
+                        "id": "seg-bridge",
+                        "start_frame": 120,
+                        "end_frame": 240,
+                        "content": {"task_mode": "default", "continuity_mode": "bridge"},
+                    },
+                    {
+                        "id": "seg-1",
+                        "start_frame": 240,
+                        "end_frame": 360,
+                        "content": {"task_mode": "default", "continuity_mode": "context"},
+                    },
+                ],
+            }
+        ],
+    }
+    initialize_h3_project("legacy_splice", spliced_info, tmp_path)
+    updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert updated["task_ids"] == ["seg-0", "seg-bridge", "seg-1"]
+    assert "0" in updated["segments"]
+    assert "1" not in updated["segments"]
+    assert "2" in updated["segments"]
+    assert updated["segments"]["2"]["generations"]["1"]["video"] == "video_2_1.mp4"
+    assert (project_dir / "video_2_1.mp4").read_bytes() == b"video-1"
+
 

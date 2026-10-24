@@ -25,6 +25,7 @@ from ..utils.h3_project import (
     h3_project_filename_prefix,
     h3_second_pass_dimensions,
     has_h3_active_segment_video,
+    has_h3_bridge_timeline_fallback,
     has_h3_context_latent,
     has_h3_first_pass_checkpoint,
     h3_task_entries,
@@ -1383,6 +1384,8 @@ class EasyMultiTrackProject(io.ComfyNode):
             )
             report_step(19)
 
+        is_bounded_subrange = segment_count > 0
+        planned_indices = {idx for idx, _ in selected_entries}
         if first_pass_only and has_second_pass:
             selected_entries = selected_entries[:1]
         selected_indices = {idx for idx, _ in selected_entries}
@@ -1678,7 +1681,9 @@ class EasyMultiTrackProject(io.ComfyNode):
                 next_continuity = "context"
             next_has_rendered_video = (
                 not audio_only
+                and is_bounded_subrange
                 and (task_index + 1) < len(all_entries)
+                and (task_index + 1) not in planned_indices
                 and (task_index + 1) not in selected_indices
                 and has_h3_active_segment_video(
                     safe_project_name,
@@ -1686,10 +1691,15 @@ class EasyMultiTrackProject(io.ComfyNode):
                     folder_paths.get_output_directory(),
                 )
             )
+            has_bridge_fallback = is_bridge and has_h3_bridge_timeline_fallback(
+                info,
+                task_index,
+            )
             will_have_outgoing_constraint = not audio_only and (
-                is_bridge
+                (is_bridge and (next_has_rendered_video or has_bridge_fallback))
                 or (
-                    end_constraint_mode != "off"
+                    not is_bridge
+                    and end_constraint_mode != "off"
                     and end_constraint_strength > 0.0
                     and next_has_rendered_video
                     and (
@@ -1895,6 +1905,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                     "project_name": safe_project_name,
                     "segment_index": task_index,
                     "tracks_info": output_info,
+                    "prefer_rendered_video": next_has_rendered_video,
                     "allow_timeline_fallback": is_bridge,
                     "degrain_strength": context_degrain_strength,
                 }

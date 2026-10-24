@@ -663,6 +663,7 @@ def _reconcile_shifted_project_segments(
     project_dir: Path,
     manifest: dict[str, Any],
     new_task_ids: list[str],
+    new_continuity_modes: list[str] | None = None,
 ) -> None:
     """Non-destructively shift segment files and manifest slots when segments are spliced or reordered."""
     if not any(new_task_ids):
@@ -677,6 +678,23 @@ def _reconcile_shifted_project_segments(
     old_task_segments = manifest.get("task_segments")
     old_count = len(old_task_segments) if isinstance(old_task_segments, list) else 0
 
+    inferred_legacy_ids: list[str] = []
+    if not old_task_ids and old_count > 0:
+        if len(new_task_ids) == old_count:
+            inferred_legacy_ids = list(new_task_ids)
+        elif (
+            len(new_task_ids) > old_count
+            and isinstance(new_continuity_modes, list)
+            and len(new_continuity_modes) == len(new_task_ids)
+        ):
+            non_bridge_ids = [
+                tid
+                for tid, mode in zip(new_task_ids, new_continuity_modes)
+                if mode != "bridge"
+            ]
+            if len(non_bridge_ids) == old_count:
+                inferred_legacy_ids = non_bridge_ids
+
     for raw_idx, seg_data in raw_segments.items():
         if not isinstance(seg_data, dict):
             continue
@@ -687,8 +705,8 @@ def _reconcile_shifted_project_segments(
                 continue
             if 0 <= idx_int < len(old_task_ids) and old_task_ids[idx_int]:
                 seg_data["task_id"] = old_task_ids[idx_int]
-            elif not old_task_ids and len(new_task_ids) == old_count and 0 <= idx_int < len(new_task_ids) and new_task_ids[idx_int]:
-                seg_data["task_id"] = new_task_ids[idx_int]
+            elif 0 <= idx_int < len(inferred_legacy_ids) and inferred_legacy_ids[idx_int]:
+                seg_data["task_id"] = inferred_legacy_ids[idx_int]
 
     id_counts: dict[str, int] = {}
     for tid in new_task_ids:
@@ -718,9 +736,9 @@ def _reconcile_shifted_project_segments(
         if old_idx != new_idx
     }
     if moving_pairs and project_dir.is_dir():
-        claimed_targets = set(shifts.values())
+        moving_targets = set(moving_pairs.values())
         moving_sources = set(moving_pairs.keys())
-        # Remove files of deleted/displaced segments whose old index is now claimed by a moving segment
+        # Only displace an unreferenced slot if a shifting segment is actively landing on old_idx
         for raw_idx, seg_data in list(raw_segments.items()):
             try:
                 old_idx = int(raw_idx)
@@ -728,8 +746,7 @@ def _reconcile_shifted_project_segments(
                 continue
             if old_idx in shifts:
                 continue
-            tid = str(seg_data.get("task_id") or "").strip() if isinstance(seg_data, dict) else ""
-            if old_idx in claimed_targets or (tid and tid not in new_index_by_id):
+            if old_idx in moving_targets:
                 for path in list(project_dir.iterdir()):
                     if not path.is_file():
                         continue
@@ -831,7 +848,16 @@ def initialize_h3_project(
     if not isinstance(manifest.get("segments"), dict):
         manifest["segments"] = {}
     new_task_ids = _h3_task_ids(info)
-    _reconcile_shifted_project_segments(project_dir, manifest, new_task_ids)
+    new_continuity_modes = [
+        _h3_continuity_mode(entry)
+        for entry in h3_task_entries(info)
+    ]
+    _reconcile_shifted_project_segments(
+        project_dir,
+        manifest,
+        new_task_ids,
+        new_continuity_modes=new_continuity_modes,
+    )
     manifest.update(
         {
             "version": 2,
@@ -999,6 +1025,37 @@ def has_h3_active_segment_video(
     except ValueError:
         return False
     return video_path.is_file()
+
+
+def has_h3_bridge_timeline_fallback(
+    tracks_info: Any,
+    current_segment_index: int,
+) -> bool:
+    """Return whether a bridge segment has a timeline reference image fallback (N+1 Picture 1 or N last image)."""
+    try:
+        info = parse_tracks_info(tracks_info)
+        entries = h3_task_entries(info)
+    except Exception:
+        return False
+
+    def _unmuted_image_count(idx: int) -> int:
+        if not (0 <= idx < len(entries)):
+            return 0
+        task = entries[idx].get("task", {})
+        content = task.get("content", {}) if isinstance(task, dict) else {}
+        raw_images = content.get("images", []) if isinstance(content, dict) else []
+        if not isinstance(raw_images, list):
+            return 0
+        return sum(
+            1
+            for img in raw_images
+            if isinstance(img, dict) and not multitrack_is_muted_image(img)
+        )
+
+    return (
+        _unmuted_image_count(int(current_segment_index) + 1) >= 1
+        or _unmuted_image_count(int(current_segment_index)) >= 2
+    )
 
 
 def _resolve_task_entry_image(

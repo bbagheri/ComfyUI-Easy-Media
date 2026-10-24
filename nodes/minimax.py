@@ -1319,6 +1319,7 @@ class EasyH3ProjectNextSegmentHeadLoad(io.ComfyNode):
                 io.String.Input("project_name"),
                 io.Int.Input("segment_index", min=0),
                 TYPE_TRACKS_INFO.Input("tracks_info", optional=True),
+                io.Boolean.Input("prefer_rendered_video", default=True, optional=True),
                 io.Boolean.Input("allow_timeline_fallback", default=False, optional=True),
                 io.Float.Input(
                     "degrain_strength",
@@ -1344,17 +1345,19 @@ class EasyH3ProjectNextSegmentHeadLoad(io.ComfyNode):
         project_name: str,
         segment_index: int,
         tracks_info: dict[str, Any] | None = None,
+        prefer_rendered_video: bool = True,
         allow_timeline_fallback: bool = False,
         degrain_strength: float | None = None,
         previous: Any | None = None,
     ) -> io.NodeOutput:
         del previous
-        images, audio = resolve_h3_next_segment_head_media(
+        images, audio, _source = resolve_h3_next_segment_head_media(
             project_name=project_name,
-            segment_index=int(segment_index),
-            output_dir=Path(folder_paths.get_output_directory()).resolve(),
+            current_segment_index=int(segment_index),
             tracks_info=tracks_info,
+            prefer_rendered_video=bool(prefer_rendered_video),
             allow_timeline_fallback=bool(allow_timeline_fallback),
+            output_directory=Path(folder_paths.get_output_directory()).resolve(),
             degrain_strength=degrain_strength,
         )
         return io.NodeOutput(images, audio)
