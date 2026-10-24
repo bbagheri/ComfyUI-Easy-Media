@@ -1011,3 +1011,179 @@ def test_audio_only_project_combine_reports_unsupported_mode(monkeypatch, tmp_pa
 
     assert (project_dir / "project.json").read_bytes() == original_manifest
     assert not list(project_dir.glob("*.mp4"))
+
+
+def test_compact_project_tasks_preserves_bridge_continuity_mode():
+    info = _tracks_info()
+    info["tracks"][0]["segments"][1]["content"]["continuity_mode"] = "bridge"
+
+    assert compact_h3_task_segments(info)[1]["continuity_mode"] == "bridge"
+
+
+def test_initialize_h3_project_shifts_segments_and_artifacts_when_bridge_spliced(tmp_path):
+    info = {
+        "width": 1344,
+        "height": 768,
+        "frame_rate": 24,
+        "format": "MiniMax",
+        "tracks": [
+            {
+                "type": "task",
+                "segments": [
+                    {
+                        "id": "seg-a",
+                        "start_frame": 0,
+                        "end_frame": 120,
+                        "content": {"task_mode": "default", "continuity_mode": "shot"},
+                    },
+                    {
+                        "id": "seg-b",
+                        "start_frame": 120,
+                        "end_frame": 240,
+                        "content": {"task_mode": "default", "continuity_mode": "context_drift"},
+                    },
+                ],
+            }
+        ],
+    }
+    project_dir = initialize_h3_project("splice_demo", info, tmp_path)
+    (project_dir / "video_0_1.mp4").write_bytes(b"video-a")
+    (project_dir / "context_latent_0_1.safetensors").write_bytes(b"latent-a")
+    (project_dir / "video_1_1.mp4").write_bytes(b"video-b")
+    (project_dir / "context_latent_1_1.safetensors").write_bytes(b"latent-b")
+    (project_dir / "context_latent_low_1_1.safetensors").write_bytes(b"latent-low-b")
+
+    manifest_path = project_dir / "project.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["segments"] = {
+        "0": {
+            "task_id": "seg-a",
+            "active_generation": 1,
+            "continuity_mode": "shot",
+            "generations": {
+                "1": {
+                    "video": "video_0_1.mp4",
+                    "context_latent": "context_latent_0_1.safetensors",
+                    "continuity_mode": "shot",
+                }
+            },
+        },
+        "1": {
+            "task_id": "seg-b",
+            "active_generation": 1,
+            "continuity_mode": "context_drift",
+            "generations": {
+                "1": {
+                    "video": "video_1_1.mp4",
+                    "context_latent": "context_latent_1_1.safetensors",
+                    "context_latent_low": "context_latent_low_1_1.safetensors",
+                    "continuity_mode": "context_drift",
+                }
+            },
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Now splice a bridge segment ("seg-bridge") between seg-a and seg-b
+    spliced_info = {
+        "width": 1344,
+        "height": 768,
+        "frame_rate": 24,
+        "format": "MiniMax",
+        "tracks": [
+            {
+                "type": "task",
+                "segments": [
+                    {
+                        "id": "seg-a",
+                        "start_frame": 0,
+                        "end_frame": 120,
+                        "content": {"task_mode": "default", "continuity_mode": "shot"},
+                    },
+                    {
+                        "id": "seg-bridge",
+                        "start_frame": 120,
+                        "end_frame": 240,
+                        "content": {"task_mode": "default", "continuity_mode": "bridge"},
+                    },
+                    {
+                        "id": "seg-b",
+                        "start_frame": 240,
+                        "end_frame": 360,
+                        "content": {"task_mode": "default", "continuity_mode": "context_drift"},
+                    },
+                ],
+            }
+        ],
+    }
+    initialize_h3_project("splice_demo", spliced_info, tmp_path)
+
+    updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert updated["task_ids"] == ["seg-a", "seg-bridge", "seg-b"]
+    assert "0" in updated["segments"]
+    assert "1" not in updated["segments"]
+    assert "2" in updated["segments"]
+    assert updated["segments"]["2"]["task_id"] == "seg-b"
+    gen2 = updated["segments"]["2"]["generations"]["1"]
+    assert gen2["video"] == "video_2_1.mp4"
+    assert gen2["context_latent"] == "context_latent_2_1.safetensors"
+    assert gen2["context_latent_low"] == "context_latent_low_2_1.safetensors"
+    assert (project_dir / "video_2_1.mp4").read_bytes() == b"video-b"
+    assert (project_dir / "context_latent_2_1.safetensors").read_bytes() == b"latent-b"
+    assert (project_dir / "context_latent_low_2_1.safetensors").read_bytes() == b"latent-low-b"
+    assert not (project_dir / "video_1_1.mp4").exists()
+
+
+def test_resolve_h3_next_segment_head_media_uses_timeline_fallback_for_bridge(tmp_path):
+    import torch
+    from utils.h3_project import resolve_h3_next_segment_head_media
+
+    next_ref_image = torch.ones((1, 64, 64, 3), dtype=torch.float32) * 0.5
+    info = {
+        "width": 64,
+        "height": 64,
+        "frame_rate": 24,
+        "format": "MiniMax",
+        "_preloaded_media": {
+            "images": [next_ref_image],
+            "audio": [],
+            "video": [],
+        },
+        "tracks": [
+            {
+                "type": "task",
+                "segments": [
+                    {
+                        "id": "seg-0",
+                        "start_frame": 0,
+                        "end_frame": 120,
+                        "content": {"task_mode": "default", "continuity_mode": "bridge", "images": []},
+                    },
+                    {
+                        "id": "seg-1",
+                        "start_frame": 120,
+                        "end_frame": 240,
+                        "content": {
+                            "task_mode": "default",
+                            "continuity_mode": "context_drift",
+                            "images": [{"media_index": 0}],
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    initialize_h3_project("bridge_fallback", info, tmp_path)
+    images, audio = resolve_h3_next_segment_head_media(
+        "bridge_fallback",
+        0,
+        tmp_path,
+        tracks_info=info,
+        allow_timeline_fallback=True,
+        head_frames=5,
+    )
+    assert images is not None
+    assert tuple(images.shape) == (5, 64, 64, 3)
+    assert torch.allclose(images, next_ref_image.repeat(5, 1, 1, 1))
+    assert audio is None
+

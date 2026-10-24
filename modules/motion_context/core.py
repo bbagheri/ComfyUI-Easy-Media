@@ -1161,3 +1161,250 @@ def apply_motion_context(
         audio_steps,
     )
     return output, span
+
+
+def _encode_head_audio(
+    audio_vae: Any,
+    audio: dict[str, Any],
+    seconds: float,
+) -> tuple[torch.Tensor, int]:
+    """Encode the opening ``seconds`` of an H3 audio dict."""
+    waveform = audio.get("waveform")
+    sample_rate = int(audio.get("sample_rate", 0))
+    if not isinstance(waveform, torch.Tensor) or sample_rate <= 0:
+        raise ValueError("easy h3 outgoing constraint: invalid outgoing_audio")
+    target_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
+    if sample_rate != target_rate:
+        try:
+            import torchaudio
+        except ImportError as error:
+            raise RuntimeError(
+                "torchaudio is required to resample H3 outgoing constraint audio"
+            ) from error
+        waveform = torchaudio.functional.resample(
+            waveform,
+            sample_rate,
+            target_rate,
+        )
+    wanted = max(1, int(round(seconds * target_rate)))
+    available = int(waveform.shape[-1])
+    if available > wanted:
+        waveform = waveform[..., :wanted]
+    elif available < wanted:
+        waveform = F.pad(waveform, (0, wanted - available))
+    encoded = audio_vae.encode(waveform[:1].movedim(1, -1))
+    return encoded, int(encoded.shape[-1])
+
+
+def apply_outgoing_tail_constraint(
+    conditioning: Any,
+    vae: Any,
+    latent: dict[str, Any],
+    outgoing_images: torch.Tensor | None,
+    outgoing_audio: dict[str, Any] | None = None,
+    audio_vae: Any | None = None,
+    trim_frames: int = 0,
+    delivered_frames: int = 120,
+    end_constraint_strength: float = 0.75,
+    reset_denoise: float | None = None,
+    is_second_pass: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    """Pin the opening frames of segment N+1 at the post-delivery overhang boundary (trim_frames + delivered_frames)."""
+    s_strength = max(0.0, min(1.0, float(end_constraint_strength)))
+    if (
+        s_strength <= 0.0
+        or outgoing_images is None
+        or not isinstance(outgoing_images, torch.Tensor)
+        or outgoing_images.ndim != 4
+        or int(outgoing_images.shape[0]) < 1
+    ):
+        return conditioning, latent
+
+    existing_video_mask, existing_audio_mask = _noise_mask_streams(latent)
+    target_parts = _streams_from_latent(latent)
+    if len(target_parts) < 2:
+        return conditioning, latent
+    target_video, target_audio = target_parts[:2]
+    if target_video.ndim == 4:
+        target_video = target_video.unsqueeze(0)
+    if target_audio.ndim == 3:
+        target_audio = target_audio.unsqueeze(0)
+    if target_video.ndim != 5 or target_audio.ndim != 4:
+        return conditioning, latent
+
+    latent_steps = int(target_video.shape[2])
+    height = int(target_video.shape[3]) * 16
+    width = int(target_video.shape[4]) * 16
+    if width <= 32 and height <= 32:
+        return conditioning, latent
+
+    target_frames = _pixel_frames(latent_steps)
+    avail_frames = int(outgoing_images.shape[0])
+    pinned_frames = 5 if avail_frames >= 5 else 1
+    safe_trim = max(0, int(trim_frames))
+    safe_delivered = max(1, int(delivered_frames))
+    nominal_end_frame = safe_trim + safe_delivered
+    max_start_frame = max(0, target_frames - pinned_frames)
+    outgoing_frame_index = min(nominal_end_frame, max_start_frame)
+    if outgoing_frame_index <= safe_trim:
+        LOGGER.warning(
+            "Skipping outgoing tail constraint: target_frames=%d cannot fit trim=%d + pinned=%d",
+            target_frames,
+            safe_trim,
+            pinned_frames,
+        )
+        return conditioning, latent
+
+    head_clip = _resize_frames(outgoing_images[:pinned_frames], width, height)
+    r_denoise = _resolve_context_reset_denoise(reset_denoise)
+
+    output_conditioning = conditioning
+    if conditioning is not None:
+        encoded_kf = vae.encode(head_clip)
+        if getattr(encoded_kf, "ndim", 0) != 5:
+            raise ValueError("easy h3 outgoing constraint: video VAE returned a non-H3 latent")
+        encoded_kf = _sanitize_context_video_latent(encoded_kf.detach())
+        kf_steps = int(encoded_kf.shape[2])
+        kf_blocks = [encoded_kf[:, :, idx : idx + 1].clone() for idx in range(kf_steps)]
+        if r_denoise > 0.0:
+            kf_blocks = _reset_context_blocks_to_ref(
+                kf_blocks,
+                conditioning=conditioning,
+                reset_denoise=r_denoise,
+            )
+        kf_offsets = [outgoing_frame_index + off for off in _step_offsets(kf_steps)]
+        outgoing_keyframes: list[dict[str, Any]] = [
+            {
+                "resolved_frame_index": int(pos),
+                "latent": blk,
+            }
+            for pos, blk in zip(kf_offsets, kf_blocks)
+            if int(pos) < target_frames
+        ]
+        if not is_second_pass and outgoing_audio is not None and audio_vae is not None:
+            try:
+                head_audio_latent, _head_audio_steps = _encode_head_audio(
+                    audio_vae,
+                    outgoing_audio,
+                    pinned_frames / FPS,
+                )
+                outgoing_keyframes.append(
+                    {
+                        "resolved_frame_index": float(outgoing_frame_index),
+                        "audio_latent": head_audio_latent,
+                    }
+                )
+            except Exception as exc:
+                LOGGER.warning("Outgoing audio keyframe encoding skipped: %s", exc)
+
+        new_cond = []
+        for embedding, metadata in conditioning:
+            values = metadata.copy()
+            prev_kfs = values.get("minimax_keyframes") or []
+            kept = [
+                dict(kf)
+                for kf in prev_kfs
+                if not (
+                    outgoing_frame_index
+                    <= float(kf.get("resolved_frame_index", -1))
+                    < outgoing_frame_index + pinned_frames
+                )
+            ]
+            values["minimax_keyframes"] = kept + outgoing_keyframes
+            new_cond.append([embedding, values])
+        output_conditioning = new_cond
+
+    step_offsets = _step_offsets(latent_steps)
+    anchor_step = 0
+    for s_idx, f_off in enumerate(step_offsets):
+        if f_off <= outgoing_frame_index:
+            anchor_step = s_idx
+        else:
+            break
+
+    min_safe_step = (_steps_for_frames(safe_trim) or 0) + 1
+    if anchor_step < min_safe_step or anchor_step >= latent_steps:
+        return output_conditioning, latent
+
+    r_phase = anchor_step % len(FRAME_PER_TOKEN)
+    pad_before = _pixel_frames(r_phase)
+    parts_to_cat: list[torch.Tensor] = []
+    if pad_before > 0:
+        parts_to_cat.append(head_clip[:1].expand(pad_before, *head_clip.shape[1:]))
+    parts_to_cat.append(head_clip)
+    current_len = pad_before + int(head_clip.shape[0])
+    if current_len < 22:
+        parts_to_cat.append(head_clip[-1:].expand(22 - current_len, *head_clip.shape[1:]))
+    phase_buffer = torch.cat(parts_to_cat, dim=0)[:22].contiguous()
+    encoded_phase = vae.encode(phase_buffer)
+    encoded_phase = _sanitize_context_video_latent(encoded_phase.detach())
+
+    want_tokens = 2 if pinned_frames >= 5 else 1
+    num_stamp = min(
+        want_tokens,
+        latent_steps - anchor_step,
+        int(encoded_phase.shape[2]) - r_phase,
+    )
+    if num_stamp < 1:
+        return output_conditioning, latent
+
+    stamp_blocks = [
+        encoded_phase[:, :, r_phase + idx : r_phase + idx + 1].clone()
+        for idx in range(num_stamp)
+    ]
+    if r_denoise > 0.0:
+        stamp_blocks = _reset_context_blocks_to_ref(
+            stamp_blocks,
+            conditioning=output_conditioning,
+            reset_denoise=r_denoise,
+        )
+
+    output_video = target_video.clone()
+    video_mask = torch.ones_like(output_video[:, :1], dtype=torch.float32)
+    straddles_cut = step_offsets[anchor_step] < outgoing_frame_index
+    m_overhang = math.ceil(max(r_denoise, 1.0 - s_strength) * 256.0) / 256.0
+    m_straddle = math.ceil(max(0.40, 1.0 - 0.55 * s_strength) * 256.0) / 256.0
+
+    for idx in range(num_stamp):
+        step_pos = anchor_step + idx
+        blk = stamp_blocks[idx].to(device=output_video.device, dtype=output_video.dtype)
+        if idx == 0 and straddles_cut:
+            if is_second_pass:
+                output_video[:, :, step_pos : step_pos + 1] = (
+                    0.5 * output_video[:, :, step_pos : step_pos + 1] + 0.5 * blk
+                )
+            else:
+                output_video[:, :, step_pos : step_pos + 1] = blk
+            video_mask[:, :, step_pos] = m_straddle
+        else:
+            output_video[:, :, step_pos : step_pos + 1] = blk
+            video_mask[:, :, step_pos] = m_overhang
+
+    audio_mask = (
+        existing_audio_mask.clone()
+        if existing_audio_mask is not None
+        else torch.zeros_like(target_audio[:, :1], dtype=torch.float32)
+        if is_second_pass
+        else torch.ones_like(target_audio[:, :1], dtype=torch.float32)
+    )
+    output_latent = latent.copy()
+    output_latent["samples"] = _official_nested_tensor((output_video, target_audio))
+    output_latent["noise_mask"] = _official_nested_tensor(
+        (
+            _merge_noise_mask(video_mask, existing_video_mask, "video"),
+            audio_mask,
+        )
+    )
+    LOGGER.info(
+        "Applied outgoing tail constraint (%s): frame=%d (trim=%d + delivered=%d), "
+        "pinned_frames=%d, latent_steps=%d:%d, strength=%.2f",
+        "pass2" if is_second_pass else "pass1",
+        outgoing_frame_index,
+        safe_trim,
+        safe_delivered,
+        pinned_frames,
+        anchor_step,
+        anchor_step + num_stamp,
+        s_strength,
+    )
+    return output_conditioning, output_latent

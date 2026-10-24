@@ -100,6 +100,8 @@ class EasyMediaExtension(ComfyExtension):
             EasyMiniMaxH3HiResContinuity,
             EasyH3MotionContextLatentTrim,
             EasyH3ProjectContextLatentLoad,
+            EasyH3ProjectNextSegmentHeadLoad,
+            EasyMiniMaxH3OutgoingConstraint,
             EasyH3ConditioningCache,
             EasyH3SegmentSamplingStart,
             EasyH3SamplingPreviewSampler,

@@ -24,6 +24,7 @@ from ..utils.h3_project import (
     minimax_frame_count,
     h3_project_filename_prefix,
     h3_second_pass_dimensions,
+    has_h3_active_segment_video,
     has_h3_context_latent,
     has_h3_first_pass_checkpoint,
     h3_task_entries,
@@ -54,7 +55,7 @@ TYPE_FAST_MODEL_LOADER = io.Custom(io_type="FAST_MODEL_LOADER")
 TYPE_TRACKS_INFO = io.Custom(io_type="TRACKS_INFO")
 TYPE_PROJECT_DATA = io.Custom(io_type="PROJECT_DATA")
 TYPE_H3_PROJECT_STATIC_DATA = io.Custom(io_type="H3_PROJECT_STATIC_DATA")
-H3_CONTEXT_CONTINUITY_MODES = {"context", "context_drift", "context_swap"}
+H3_CONTEXT_CONTINUITY_MODES = {"context", "context_drift", "context_swap", "bridge"}
 H3_CONTEXT_SOURCE_FRAMES = 22
 
 
@@ -1064,6 +1065,34 @@ class EasyMultiTrackProject(io.ComfyNode):
                         "while preserving chained pose/motion/audio)."
                     ),
                 ),
+                io.Combo.Input(
+                    "end_constraint_mode",
+                    options=["auto_when_next_exists", "always_when_next_exists", "off"],
+                    default="auto_when_next_exists",
+                    optional=True,
+                    tooltip=(
+                        "Bidirectional outgoing constraint when regenerating a segment "
+                        "whose succeeding segment (N+1) already has a rendered video on disk: "
+                        "'auto_when_next_exists' constrains when segment N+1 uses context/bridge "
+                        "continuity, 'always_when_next_exists' constrains whenever segment N+1 "
+                        "exists on disk, 'off' disables automatic end constraints (bridge segments "
+                        "always constrain their outgoing boundary)."
+                    ),
+                ),
+                io.Float.Input(
+                    "end_constraint_strength",
+                    default=0.75,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    round=0.01,
+                    extra_dict={"precision": 2},
+                    optional=True,
+                    tooltip=(
+                        "Outgoing boundary constraint strength (0.0 = disabled, 0.75 = default, "
+                        "1.0 = hard-lock post-delivery overhang boundary to segment N+1's opening frames)."
+                    ),
+                ),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[
@@ -1173,6 +1202,20 @@ class EasyMultiTrackProject(io.ComfyNode):
             _first_input(
                 sampling_config.get("context_reset_denoise"),
                 _first_input(kwargs.get("context_reset_denoise"), 0.35),
+            )
+        )
+        end_constraint_mode = str(
+            _first_input(
+                sampling_config.get("end_constraint_mode"),
+                _first_input(kwargs.get("end_constraint_mode"), "auto_when_next_exists"),
+            )
+        ).lower()
+        if end_constraint_mode not in {"auto_when_next_exists", "always_when_next_exists", "off"}:
+            end_constraint_mode = "auto_when_next_exists"
+        end_constraint_strength = float(
+            _first_input(
+                sampling_config.get("end_constraint_strength"),
+                _first_input(kwargs.get("end_constraint_strength"), 0.75),
             )
         )
         os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(context_degrain_strength)
@@ -1342,6 +1385,7 @@ class EasyMultiTrackProject(io.ComfyNode):
 
         if first_pass_only and has_second_pass:
             selected_entries = selected_entries[:1]
+        selected_indices = {idx for idx, _ in selected_entries}
         log_node_info(
             node_name,
             f"Found {len(all_entries)} segments; processing {len(selected_entries)}",
@@ -1609,6 +1653,56 @@ class EasyMultiTrackProject(io.ComfyNode):
                 continuity_mode = "context"
             uses_context = continuity_mode in H3_CONTEXT_CONTINUITY_MODES
             uses_swap = continuity_mode in {"context_drift", "context_swap"}
+            is_bridge = continuity_mode == "bridge"
+            next_entry = (
+                all_entries[task_index + 1]
+                if (task_index + 1) < len(all_entries)
+                else None
+            )
+            next_task = (
+                next_entry.get("task", {})
+                if isinstance(next_entry, dict)
+                else {}
+            )
+            next_content = (
+                next_task.get("content", {})
+                if isinstance(next_task, dict)
+                else {}
+            )
+            next_continuity = (
+                str(next_content.get("continuity_mode", "shot")).lower()
+                if isinstance(next_content, dict)
+                else "shot"
+            )
+            if next_continuity == "context_test":
+                next_continuity = "context"
+            next_has_rendered_video = (
+                not audio_only
+                and (task_index + 1) < len(all_entries)
+                and (task_index + 1) not in selected_indices
+                and has_h3_active_segment_video(
+                    safe_project_name,
+                    task_index + 1,
+                    folder_paths.get_output_directory(),
+                )
+            )
+            will_have_outgoing_constraint = not audio_only and (
+                is_bridge
+                or (
+                    end_constraint_mode != "off"
+                    and end_constraint_strength > 0.0
+                    and next_has_rendered_video
+                    and (
+                        end_constraint_mode == "always_when_next_exists"
+                        or next_continuity in H3_CONTEXT_CONTINUITY_MODES
+                    )
+                )
+            )
+            effective_end_constraint_strength = (
+                end_constraint_strength
+                if end_constraint_strength > 0.0
+                else (0.75 if is_bridge else 0.0)
+            )
             aligned_task_length: Any = (
                 minimax_frame_count(base_task_length, round_up=True)
                 if preserve_source_timing
@@ -1621,11 +1715,19 @@ class EasyMultiTrackProject(io.ComfyNode):
             )
             context_source_frames = H3_CONTEXT_SOURCE_FRAMES
             context_generation_frames = 34
+            outgoing_only_generation_frames = 17
             if will_have_context_continuity:
                 task_length = graph.node(
                     "ComfyMathExpression",
                     id=f"context_length_{task_index}",
                     expression=f"a + {context_generation_frames}",
+                    **{"values.a": task_length},
+                ).out(1)
+            elif will_have_outgoing_constraint:
+                task_length = graph.node(
+                    "ComfyMathExpression",
+                    id=f"outgoing_length_{task_index}",
+                    expression=f"a + {outgoing_only_generation_frames}",
                     **{"values.a": task_length},
                 ).out(1)
             report_segment_step(0.10)
@@ -1782,7 +1884,48 @@ class EasyMultiTrackProject(io.ComfyNode):
                     context_trim_frames = first_pass_context_trim_frames
                     initial_latent = motion_context.out(2)
             else:
+                if will_have_outgoing_constraint:
+                    first_pass_context_trim_frames = 0
+                    context_trim_frames = 0
                 report_segment_step(0.22)
+
+            next_head = None
+            if will_have_outgoing_constraint:
+                next_head_inputs: dict[str, Any] = {
+                    "project_name": safe_project_name,
+                    "segment_index": task_index,
+                    "tracks_info": output_info,
+                    "allow_timeline_fallback": is_bridge,
+                    "degrain_strength": context_degrain_strength,
+                }
+                if previous_artifact is not None:
+                    next_head_inputs["previous"] = previous_artifact
+                next_head = graph.node(
+                    "easy h3ProjectNextSegmentHeadLoad",
+                    id=f"load_next_head_{task_index}",
+                    **next_head_inputs,
+                )
+                outgoing_pass1 = graph.node(
+                    "easy minimaxH3OutgoingConstraint",
+                    id=f"outgoing_constraint_pass1_{task_index}",
+                    conditioning=positive,
+                    vae=vae,
+                    audio_vae=audio_vae,
+                    latent=initial_latent,
+                    outgoing_images=next_head.out(0),
+                    outgoing_audio=next_head.out(1),
+                    trim_frames=(
+                        first_pass_context_trim_frames
+                        if first_pass_context_trim_frames is not None
+                        else 0
+                    ),
+                    delivered_frames=base_task_length,
+                    end_constraint_strength=effective_end_constraint_strength,
+                    reset_denoise=context_reset_denoise,
+                    is_second_pass=False,
+                )
+                positive = outgoing_pass1.out(0)
+                initial_latent = outgoing_pass1.out(1)
 
             report_segment_step(0.28)
             selflift_low_latent: Any | None = None
@@ -1986,6 +2129,29 @@ class EasyMultiTrackProject(io.ComfyNode):
                     )
                     upscaled_latent = hires_continuity.out(0)
                     context_trim_frames = hires_continuity.out(1)
+
+                if will_have_outgoing_constraint and next_head is not None:
+                    outgoing_pass2 = graph.node(
+                        "easy minimaxH3OutgoingConstraint",
+                        id=f"outgoing_constraint_pass2_{task_index}",
+                        conditioning=second_pass_positive,
+                        vae=vae,
+                        audio_vae=audio_vae,
+                        latent=upscaled_latent,
+                        outgoing_images=next_head.out(0),
+                        outgoing_audio=next_head.out(1),
+                        trim_frames=(
+                            context_trim_frames
+                            if context_trim_frames is not None
+                            else 0
+                        ),
+                        delivered_frames=base_task_length,
+                        end_constraint_strength=effective_end_constraint_strength,
+                        reset_denoise=context_reset_denoise,
+                        is_second_pass=True,
+                    )
+                    second_pass_positive = outgoing_pass2.out(0)
+                    upscaled_latent = outgoing_pass2.out(1)
 
                 report_segment_step(0.62)
                 second_pass_noise = graph.node(

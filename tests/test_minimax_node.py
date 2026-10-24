@@ -3820,6 +3820,7 @@ def test_multitrack_h3_context_uses_embedded_five_frame_anchor(monkeypatch):
         "context_length",
         "anchor_images",
         "vae",
+        "degrain_strength",
     }
     first_artifact = next(
         node
@@ -6218,3 +6219,187 @@ def test_minimax_prompt_override_node_has_complete_chinese_localization():
     assert translation["inputs"]["video_track_lock"]["name"] == "视频轨锁定"
     assert translation["inputs"]["audio_track_lock"]["name"] == "音频轨锁定"
     assert translation["outputs"] == {"0": {"name": "提示词覆盖"}}
+
+
+def test_multitrack_h3_regenerating_middle_segment_constrains_from_both_ends(
+    monkeypatch, tmp_path
+):
+    module = _load_minimax_node(monkeypatch)
+    monkeypatch.setattr(
+        module.folder_paths,
+        "get_output_directory",
+        lambda: str(tmp_path),
+    )
+    project_dir = tmp_path / "easy_media" / "projects" / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "context_latent_0_1.safetensors").write_bytes(b"latent0")
+    (project_dir / "video_0_1.mp4").write_bytes(b"video0")
+    (project_dir / "context_latent_1_1.safetensors").write_bytes(b"latent1")
+    (project_dir / "video_1_1.mp4").write_bytes(b"video1")
+    (project_dir / "context_latent_2_1.safetensors").write_bytes(b"latent2")
+    (project_dir / "video_2_1.mp4").write_bytes(b"video2")
+    (project_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "project_name": "demo",
+                "segments": {
+                    "0": {
+                        "active_generation": 1,
+                        "generations": {
+                            "1": {
+                                "context_latent": "context_latent_0_1.safetensors",
+                                "video": "video_0_1.mp4",
+                                "continuity_mode": "shot",
+                            }
+                        },
+                    },
+                    "1": {
+                        "active_generation": 1,
+                        "generations": {
+                            "1": {
+                                "context_latent": "context_latent_1_1.safetensors",
+                                "video": "video_1_1.mp4",
+                                "continuity_mode": "context_drift",
+                            }
+                        },
+                    },
+                    "2": {
+                        "active_generation": 1,
+                        "generations": {
+                            "1": {
+                                "context_latent": "context_latent_2_1.safetensors",
+                                "video": "video_2_1.mp4",
+                                "continuity_mode": "context_drift",
+                            }
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = _h3_project_inputs()["tracks_info"][0]
+    info["tracks"][0]["segments"] = [
+        {
+            "id": "seg-0",
+            "start_frame": 0,
+            "end_frame": 120,
+            "content": {"task_mode": "default", "continuity_mode": "shot", "images": []},
+        },
+        {
+            "id": "seg-1",
+            "start_frame": 120,
+            "end_frame": 240,
+            "content": {"task_mode": "default", "continuity_mode": "context_drift", "images": []},
+        },
+        {
+            "id": "seg-2",
+            "start_frame": 240,
+            "end_frame": 360,
+            "content": {"task_mode": "default", "continuity_mode": "context_drift", "images": []},
+        },
+    ]
+
+    # Regenerate ONLY middle segment (segment_start_number=2 -> index 1, segment_count=1)
+    result = module.EasyMultiTrackProject.execute(
+        **_h3_project_inputs(
+            project_name="demo",
+            tracks_info=[info],
+            segment_start_number=[2],
+            segment_count=[1],
+            sampling_mode=_h3_sampling_mode("dual", upscale_by=[1.25]),
+            end_constraint_mode=["auto_when_next_exists"],
+            end_constraint_strength=[0.8],
+        )
+    )
+
+    nodes = list(result.expand.values())
+    # Must load incoming context from segment 0 AND next head media from segment 1's successor (segment 2)
+    assert any(
+        node["class_type"] == "easy h3ProjectContextLatentLoad"
+        and node["inputs"]["segment_index"] == 0
+        for node in nodes
+    )
+    head_load = next(
+        node
+        for node in nodes
+        if node["class_type"] == "easy h3ProjectNextSegmentHeadLoad"
+    )
+    assert head_load["inputs"]["segment_index"] == 1
+    assert head_load["inputs"]["allow_timeline_fallback"] is False
+
+    outgoing_constraints = [
+        node
+        for node in nodes
+        if node["class_type"] == "easy minimaxH3OutgoingConstraint"
+    ]
+    # Dual-pass should wire both pass 1 and pass 2 outgoing constraints
+    assert len(outgoing_constraints) == 2
+    assert [node["inputs"]["is_second_pass"] for node in outgoing_constraints] == [
+        False,
+        True,
+    ]
+    assert all(
+        node["inputs"]["end_constraint_strength"] == 0.8
+        for node in outgoing_constraints
+    )
+
+
+def test_multitrack_h3_bridge_segment_wires_incoming_context_and_outgoing_constraint(
+    monkeypatch, tmp_path
+):
+    module = _load_minimax_node(monkeypatch)
+    monkeypatch.setattr(
+        module.folder_paths,
+        "get_output_directory",
+        lambda: str(tmp_path),
+    )
+    info = _h3_project_inputs()["tracks_info"][0]
+    info["tracks"][0]["segments"] = [
+        {
+            "id": "seg-0",
+            "start_frame": 0,
+            "end_frame": 120,
+            "content": {"task_mode": "default", "continuity_mode": "shot", "images": []},
+        },
+        {
+            "id": "seg-bridge",
+            "start_frame": 120,
+            "end_frame": 240,
+            "content": {"task_mode": "default", "continuity_mode": "bridge", "images": []},
+        },
+        {
+            "id": "seg-2",
+            "start_frame": 240,
+            "end_frame": 360,
+            "content": {"task_mode": "default", "continuity_mode": "context", "images": []},
+        },
+    ]
+
+    result = module.EasyMultiTrackProject.execute(
+        **_h3_project_inputs(
+            project_name="bridge_demo",
+            tracks_info=[info],
+            sampling_mode=_h3_sampling_mode("single"),
+        )
+    )
+    nodes = list(result.expand.values())
+    head_loads = [
+        node
+        for node in nodes
+        if node["class_type"] == "easy h3ProjectNextSegmentHeadLoad"
+    ]
+    assert len(head_loads) == 1
+    assert head_loads[0]["inputs"]["segment_index"] == 1
+    assert head_loads[0]["inputs"]["allow_timeline_fallback"] is True
+
+    outgoing = [
+        node
+        for node in nodes
+        if node["class_type"] == "easy minimaxH3OutgoingConstraint"
+    ]
+    assert len(outgoing) == 1
+    assert outgoing[0]["inputs"]["is_second_pass"] is False
+

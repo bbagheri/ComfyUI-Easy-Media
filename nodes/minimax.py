@@ -19,6 +19,7 @@ from ..modules.motion_context.core import (
     apply_hires_anchor_continuity,
     apply_hires_continuity,
     apply_motion_context,
+    apply_outgoing_tail_constraint,
     apply_reencoded_anchor_motion_context,
     build_hard_motion_context,
     trim_motion_context_latent,
@@ -26,10 +27,12 @@ from ..modules.motion_context.core import (
 from ..modules.motion_context.drift_control_av import apply_context_swap_drift_control
 from ..utils import log_node_info, log_stage_time, synchronize_execution_device
 from ..utils.h3_project import (
+    _h3_task_ids,
     choose_h3_generation,
     compact_h3_task_segments,
     load_h3_latent,
     parse_tracks_info,
+    resolve_h3_next_segment_head_media,
     safe_h3_project_name,
     save_h3_latent,
     save_h3_audio,
@@ -139,8 +142,8 @@ class EasyMinimaxPromptOverride(io.ComfyNode):
                     default="shot",
                     tooltip=(
                         "Continuity mode per clip. Supported values are shot, "
-                        "context, and context_drift (legacy context_swap); a single value "
-                        "applies to every "
+                        "context, context_drift (legacy context_swap), and bridge; "
+                        "a single value applies to every "
                         "clip, while comma-separated values like shot,context,context "
                         "assign modes in order and reuse the last value when fewer "
                         "are provided."
@@ -1297,6 +1300,141 @@ class EasyH3ProjectContextLatentLoad(io.ComfyNode):
         if not latent_path.is_file():
             raise FileNotFoundError(f"H3 context latent was not found: {latent_path}")
         return io.NodeOutput(load_h3_latent(latent_path))
+
+
+class EasyH3ProjectNextSegmentHeadLoad(io.ComfyNode):
+    """Load the opening frames and audio of segment N+1 for outgoing boundary constraints."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="easy h3ProjectNextSegmentHeadLoad",
+            display_name="H3 Project Next Segment Head Load",
+            category="EasyUse/H3/dev",
+            description=(
+                "Internal loader for segment N+1 head media (rendered video/audio "
+                "or timeline entry image fallback for bridge segments)."
+            ),
+            inputs=[
+                io.String.Input("project_name"),
+                io.Int.Input("segment_index", min=0),
+                TYPE_TRACKS_INFO.Input("tracks_info", optional=True),
+                io.Boolean.Input("allow_timeline_fallback", default=False, optional=True),
+                io.Float.Input(
+                    "degrain_strength",
+                    default=0.65,
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    optional=True,
+                ),
+                io.AnyType.Input("previous", optional=True),
+            ],
+            outputs=[
+                io.Image.Output("outgoing_images"),
+                io.Audio.Output("outgoing_audio"),
+            ],
+            not_idempotent=True,
+            is_dev_only=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        project_name: str,
+        segment_index: int,
+        tracks_info: dict[str, Any] | None = None,
+        allow_timeline_fallback: bool = False,
+        degrain_strength: float | None = None,
+        previous: Any | None = None,
+    ) -> io.NodeOutput:
+        del previous
+        images, audio = resolve_h3_next_segment_head_media(
+            project_name=project_name,
+            segment_index=int(segment_index),
+            output_dir=Path(folder_paths.get_output_directory()).resolve(),
+            tracks_info=tracks_info,
+            allow_timeline_fallback=bool(allow_timeline_fallback),
+            degrain_strength=degrain_strength,
+        )
+        return io.NodeOutput(images, audio)
+
+
+class EasyMiniMaxH3OutgoingConstraint(io.ComfyNode):
+    """Pin the outgoing post-delivery boundary of an H3 segment to segment N+1's head media."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="easy minimaxH3OutgoingConstraint",
+            display_name="MiniMax H3 Outgoing Constraint",
+            category=CATEGORY_MINIMAX,
+            description=(
+                "Pin the post-delivery overhang boundary of a regenerated or bridge "
+                "MiniMax H3 segment to the opening frames and audio of segment N+1."
+            ),
+            inputs=[
+                io.Conditioning.Input("conditioning"),
+                io.Vae.Input("vae"),
+                io.Latent.Input("latent"),
+                io.Int.Input("trim_frames", default=0, min=0),
+                io.Int.Input("delivered_frames", default=1, min=1),
+                io.Float.Input(
+                    "end_constraint_strength",
+                    default=0.75,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                ),
+                io.Float.Input(
+                    "reset_denoise",
+                    default=0.25,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
+                io.Boolean.Input("is_second_pass", default=False, optional=True),
+                io.Image.Input("outgoing_images", optional=True),
+                io.Audio.Input("outgoing_audio", optional=True),
+                io.Vae.Input("audio_vae", optional=True),
+            ],
+            outputs=[
+                io.Conditioning.Output("conditioning"),
+                io.Latent.Output("latent"),
+            ],
+            is_dev_only=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        conditioning: list[list[Any]],
+        vae: Any,
+        latent: dict[str, Any],
+        trim_frames: int = 0,
+        delivered_frames: int = 1,
+        end_constraint_strength: float = 0.75,
+        reset_denoise: float = 0.25,
+        is_second_pass: bool = False,
+        outgoing_images: torch.Tensor | None = None,
+        outgoing_audio: dict[str, Any] | None = None,
+        audio_vae: Any | None = None,
+    ) -> io.NodeOutput:
+        output_conditioning, output_latent = apply_outgoing_tail_constraint(
+            conditioning=conditioning,
+            vae=vae,
+            latent=latent,
+            outgoing_images=outgoing_images,
+            outgoing_audio=outgoing_audio,
+            audio_vae=audio_vae,
+            trim_frames=int(trim_frames),
+            delivered_frames=int(delivered_frames),
+            end_constraint_strength=float(end_constraint_strength),
+            reset_denoise=float(reset_denoise if reset_denoise is not None else 0.25),
+            is_second_pass=bool(is_second_pass),
+        )
+        return io.NodeOutput(output_conditioning, output_latent)
 
 
 class EasyH3ConditioningCache(io.ComfyNode):
@@ -2509,7 +2647,7 @@ class EasyH3ProjectArtifact(io.ComfyNode):
                 TYPE_TRACKS_INFO.Input("tracks_info"),
                 io.Combo.Input(
                     "continuity_mode",
-                    options=["shot", "context", "context_drift", "context_swap"],
+                    options=["shot", "context", "context_drift", "context_swap", "bridge"],
                     default="shot",
                 ),
                 io.Combo.Input(
@@ -2560,9 +2698,9 @@ class EasyH3ProjectArtifact(io.ComfyNode):
         if sampling_pass not in {"single", "first", "second"}:
             raise ValueError("sampling_pass must be 'single', 'first', or 'second'")
         continuity_mode = str(continuity_mode).lower()
-        if continuity_mode not in {"shot", "context", "context_drift", "context_swap"}:
+        if continuity_mode not in {"shot", "context", "context_drift", "context_swap", "bridge"}:
             raise ValueError(
-                "continuity_mode must be 'shot', 'context', 'context_drift', or 'context_swap'"
+                "continuity_mode must be 'shot', 'context', 'context_drift', 'context_swap', or 'bridge'"
             )
         if continuity_mode == "context_swap":
             continuity_mode = "context_drift"
@@ -2671,6 +2809,9 @@ class EasyH3ProjectArtifact(io.ComfyNode):
                 "task_segments": compact_h3_task_segments(info),
             }
         )
+        task_ids = _h3_task_ids(info)
+        if any(task_ids):
+            manifest["task_ids"] = task_ids
         manifest.pop("tracks_info", None)
         manifest.pop("last_render", None)
         segments = manifest.setdefault("segments", {})
@@ -2682,6 +2823,8 @@ class EasyH3ProjectArtifact(io.ComfyNode):
         if not isinstance(segment_manifest, dict):
             segment_manifest = {}
             segments[segment_key] = segment_manifest
+        if 0 <= int(segment_index) < len(task_ids) and task_ids[int(segment_index)]:
+            segment_manifest["task_id"] = task_ids[int(segment_index)]
         versions = segment_manifest.setdefault("generations", {})
         if not isinstance(versions, dict):
             versions = {}

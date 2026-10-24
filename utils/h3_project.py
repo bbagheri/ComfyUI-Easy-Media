@@ -263,7 +263,7 @@ def _h3_continuity_mode(value: Any) -> str:
         return "context"
     if normalized == "context_swap":
         return "context_drift"
-    return normalized if normalized in {"context", "context_drift"} else "shot"
+    return normalized if normalized in {"context", "context_drift", "bridge"} else "shot"
 
 
 def h3_task_segments(info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -633,6 +633,175 @@ def delete_h3_project(
         raise RuntimeError(f"Failed to delete project {safe_name}: {error}") from error
 
 
+def _h3_task_ids(info: dict[str, Any]) -> list[str]:
+    """Return persistent timeline UUIDs for each task segment entry."""
+    ids: list[str] = []
+    for entry in h3_task_entries(info):
+        task = entry.get("task", {})
+        task_id = str(task.get("id") or "").strip() if isinstance(task, dict) else ""
+        ids.append(task_id)
+    return ids
+
+
+_SHIFT_ARTIFACT_FIELDS = (
+    "video",
+    "audio",
+    "locked_audio",
+    "latent",
+    "context_latent",
+    "context_latent_low",
+    "anchor_latent",
+    "anchor_latent_low",
+)
+_SHIFT_FILENAME_RE = re.compile(
+    r"^(video|audio|locked_audio|latent|context_latent|context_latent_low|anchor_latent|anchor_latent_low)_"
+    r"(\d+)_(\d+)(\.[^.]+)?$"
+)
+
+
+def _reconcile_shifted_project_segments(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    new_task_ids: list[str],
+) -> None:
+    """Non-destructively shift segment files and manifest slots when segments are spliced or reordered."""
+    if not any(new_task_ids):
+        return
+    raw_segments = manifest.get("segments")
+    if not isinstance(raw_segments, dict):
+        manifest["task_ids"] = new_task_ids
+        return
+
+    old_task_ids = manifest.get("task_ids")
+    old_task_ids = [str(x or "") for x in old_task_ids] if isinstance(old_task_ids, list) else []
+    old_task_segments = manifest.get("task_segments")
+    old_count = len(old_task_segments) if isinstance(old_task_segments, list) else 0
+
+    for raw_idx, seg_data in raw_segments.items():
+        if not isinstance(seg_data, dict):
+            continue
+        if not seg_data.get("task_id"):
+            try:
+                idx_int = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx_int < len(old_task_ids) and old_task_ids[idx_int]:
+                seg_data["task_id"] = old_task_ids[idx_int]
+            elif not old_task_ids and len(new_task_ids) == old_count and 0 <= idx_int < len(new_task_ids) and new_task_ids[idx_int]:
+                seg_data["task_id"] = new_task_ids[idx_int]
+
+    id_counts: dict[str, int] = {}
+    for tid in new_task_ids:
+        if tid:
+            id_counts[tid] = id_counts.get(tid, 0) + 1
+    new_index_by_id = {
+        tid: idx
+        for idx, tid in enumerate(new_task_ids)
+        if tid and id_counts.get(tid) == 1
+    }
+
+    shifts: dict[int, int] = {}
+    for raw_idx, seg_data in raw_segments.items():
+        if not isinstance(seg_data, dict):
+            continue
+        try:
+            old_idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        tid = str(seg_data.get("task_id") or "").strip()
+        if tid and tid in new_index_by_id:
+            shifts[old_idx] = new_index_by_id[tid]
+
+    moving_pairs = {
+        old_idx: new_idx
+        for old_idx, new_idx in shifts.items()
+        if old_idx != new_idx
+    }
+    if moving_pairs and project_dir.is_dir():
+        claimed_targets = set(shifts.values())
+        moving_sources = set(moving_pairs.keys())
+        # Remove files of deleted/displaced segments whose old index is now claimed by a moving segment
+        for raw_idx, seg_data in list(raw_segments.items()):
+            try:
+                old_idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if old_idx in shifts:
+                continue
+            tid = str(seg_data.get("task_id") or "").strip() if isinstance(seg_data, dict) else ""
+            if old_idx in claimed_targets or (tid and tid not in new_index_by_id):
+                for path in list(project_dir.iterdir()):
+                    if not path.is_file():
+                        continue
+                    m = _SHIFT_FILENAME_RE.match(path.name)
+                    if m and int(m.group(2)) == old_idx:
+                        path.unlink(missing_ok=True)
+                raw_segments.pop(str(old_idx), None)
+
+        staged_moves: list[tuple[Path, Path]] = []
+        for path in list(project_dir.iterdir()):
+            if not path.is_file():
+                continue
+            m = _SHIFT_FILENAME_RE.match(path.name)
+            if m is None:
+                continue
+            prefix, idx_str, gen_str, ext = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+            old_idx = int(idx_str)
+            if old_idx not in moving_sources:
+                continue
+            new_idx = moving_pairs[old_idx]
+            tmp_path = project_dir / f".shift_tmp_{prefix}_{old_idx}_to_{new_idx}_{gen_str}{ext}"
+            final_path = project_dir / f"{prefix}_{new_idx}_{gen_str}{ext}"
+            path.replace(tmp_path)
+            staged_moves.append((tmp_path, final_path))
+
+        for tmp_path, final_path in staged_moves:
+            tmp_path.replace(final_path)
+
+        new_segments: dict[str, Any] = {}
+        for raw_idx, seg_data in raw_segments.items():
+            try:
+                old_idx = int(raw_idx)
+            except (TypeError, ValueError):
+                new_segments[str(raw_idx)] = seg_data
+                continue
+            target_idx = shifts.get(old_idx, old_idx)
+            if isinstance(seg_data, dict) and target_idx != old_idx:
+                generations = seg_data.get("generations")
+                if isinstance(generations, dict):
+                    for gen_data in generations.values():
+                        if not isinstance(gen_data, dict):
+                            continue
+                        for field in _SHIFT_ARTIFACT_FIELDS:
+                            fname = gen_data.get(field)
+                            if not isinstance(fname, str) or not fname:
+                                continue
+                            fm = _SHIFT_FILENAME_RE.match(fname)
+                            if fm is not None and int(fm.group(2)) == old_idx:
+                                ext = fm.group(4) or ""
+                                gen_data[field] = f"{fm.group(1)}_{target_idx}_{fm.group(3)}{ext}"
+            if isinstance(seg_data, dict) and 0 <= target_idx < len(new_task_ids) and new_task_ids[target_idx]:
+                seg_data["task_id"] = new_task_ids[target_idx]
+            new_segments[str(target_idx)] = seg_data
+        manifest["segments"] = new_segments
+        logger.info(
+            "Re-indexed H3 project segments after timeline splice/edit: %s",
+            moving_pairs,
+        )
+    else:
+        for raw_idx, seg_data in raw_segments.items():
+            if not isinstance(seg_data, dict):
+                continue
+            try:
+                idx_int = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx_int < len(new_task_ids) and new_task_ids[idx_int]:
+                seg_data["task_id"] = new_task_ids[idx_int]
+
+    manifest["task_ids"] = new_task_ids
+
+
 def initialize_h3_project(
     project_name: Any,
     tracks_info: Any,
@@ -659,6 +828,10 @@ def initialize_h3_project(
         if not isinstance(loaded, dict):
             raise ValueError(f"Project manifest must be an object: {manifest_path}")
         manifest = loaded
+    if not isinstance(manifest.get("segments"), dict):
+        manifest["segments"] = {}
+    new_task_ids = _h3_task_ids(info)
+    _reconcile_shifted_project_segments(project_dir, manifest, new_task_ids)
     manifest.update(
         {
             "version": 2,
@@ -671,8 +844,6 @@ def initialize_h3_project(
     )
     manifest.pop("tracks_info", None)
     manifest.pop("last_render", None)
-    if not isinstance(manifest.get("segments"), dict):
-        manifest["segments"] = {}
     temporary = project_dir / ".project.json.tmp"
     try:
         temporary.write_text(
@@ -798,6 +969,206 @@ def h3_active_segment_is_passthrough(
     ):
         return False
     return isinstance(mode, str) and mode.lower() == "passthrough"
+
+
+def has_h3_active_segment_video(
+    project_name: Any,
+    segment_index: int,
+    output_directory: str | Path | None = None,
+) -> bool:
+    """Return whether ``segment_index`` has an active rendered video on disk."""
+    safe_name = safe_h3_project_name(project_name)
+    project_dir = (
+        Path(output_directory).resolve() / "easy_media" / "projects" / safe_name
+        if output_directory is not None
+        else h3_project_directory(safe_name)
+    )
+    manifest_path = project_dir / "project.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        segment = manifest["segments"][str(int(segment_index))]
+        generation = str(int(segment["active_generation"]))
+        filename = segment["generations"][generation].get("video")
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not filename:
+        return False
+    video_path = (project_dir / str(filename)).resolve()
+    try:
+        video_path.relative_to(project_dir.resolve())
+    except ValueError:
+        return False
+    return video_path.is_file()
+
+
+def _resolve_task_entry_image(
+    info: dict[str, Any],
+    task_index: int,
+    *,
+    pick_last: bool = False,
+    min_unmuted_count: int = 1,
+) -> torch.Tensor | None:
+    entries = h3_task_entries(info)
+    if not (0 <= int(task_index) < len(entries)):
+        return None
+    task = entries[int(task_index)].get("task", {})
+    content = task.get("content", {}) if isinstance(task, dict) else {}
+    raw_images = content.get("images", []) if isinstance(content, dict) else []
+    if not isinstance(raw_images, list):
+        return None
+    unmuted = [
+        img for img in raw_images
+        if isinstance(img, dict) and not multitrack_is_muted_image(img)
+    ]
+    if len(unmuted) < min_unmuted_count:
+        return None
+    chosen_info = unmuted[-1] if pick_last else unmuted[0]
+    image_items = _embedded_multitrack_media(info, "images")
+    image = _resolve_timeline_image_item(chosen_info, image_items)
+    if image is None or not isinstance(image, torch.Tensor) or image.ndim != 4 or int(image.shape[0]) < 1:
+        return None
+    panorama_view = chosen_info.get("panorama_view")
+    if panorama_view is not None:
+        width = int(info.get("width", 1344) or 1344)
+        height = int(info.get("height", 768) or 768)
+        image = equirectangular_to_perspective(image, panorama_view, width, height)
+    return image[:1].detach().cpu().float().contiguous()
+
+
+def resolve_h3_next_segment_head_media(
+    project_name: Any,
+    current_segment_index: int,
+    tracks_info: Any = None,
+    *,
+    head_frames: int = 5,
+    prefer_rendered_video: bool = True,
+    allow_timeline_fallback: bool = False,
+    output_directory: str | Path | None = None,
+    degrain_strength: float | None = None,
+) -> tuple[torch.Tensor | None, dict[str, Any] | None, str]:
+    """Load the opening frames (and optional audio) of segment N+1 for outgoing boundary constraints."""
+    import subprocess
+    from .minimax import _degrain_context_suffix
+    from .video import ffprobe_info, get_ffmpeg_path
+
+    safe_name = safe_h3_project_name(project_name)
+    next_index = int(current_segment_index) + 1
+    project_dir = (
+        Path(output_directory).resolve() / "easy_media" / "projects" / safe_name
+        if output_directory is not None
+        else h3_project_directory(safe_name)
+    )
+    manifest_path = project_dir / "project.json"
+    if prefer_rendered_video and manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            segment = manifest["segments"][str(next_index)]
+            generation = str(int(segment["active_generation"]))
+            filename = segment["generations"][generation].get("video")
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            filename = None
+            manifest = {}
+        if filename:
+            video_path = (project_dir / str(filename)).resolve()
+            try:
+                video_path.relative_to(project_dir.resolve())
+                is_valid_file = video_path.is_file()
+            except ValueError:
+                is_valid_file = False
+            if is_valid_file:
+                ffmpeg = get_ffmpeg_path("ffmpeg")
+                if ffmpeg is not None:
+                    try:
+                        v_info = ffprobe_info(str(video_path))
+                        width = int(v_info.get("width") or manifest.get("width") or 1280)
+                        height = int(v_info.get("height") or manifest.get("height") or 720)
+                        fps = float(v_info.get("fps") or manifest.get("fps") or 24.0)
+                        wanted = max(1, int(head_frames))
+                        v_res = subprocess.run(
+                            [
+                                ffmpeg, "-v", "error",
+                                "-i", str(video_path),
+                                "-map", "0:v:0",
+                                "-vf", f"scale={width}:{height}",
+                                "-frames:v", str(wanted),
+                                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+                            ],
+                            capture_output=True,
+                            timeout=60,
+                        )
+                        frame_bytes = width * height * 3
+                        actual_frames = len(v_res.stdout) // frame_bytes if frame_bytes > 0 else 0
+                        if v_res.returncode == 0 and actual_frames >= 1:
+                            raw = bytearray(v_res.stdout[: actual_frames * frame_bytes])
+                            images = (
+                                torch.frombuffer(raw, dtype=torch.uint8)
+                                .reshape(actual_frames, height, width, 3)
+                                .to(torch.float32)
+                                / 255.0
+                            )
+                            if actual_frames < wanted and wanted == 5:
+                                images = torch.cat(
+                                    (images, images[-1:].expand(wanted - actual_frames, -1, -1, -1)),
+                                    dim=0,
+                                )
+                            images = _degrain_context_suffix(images, strength=degrain_strength)
+                            audio_dict: dict[str, Any] | None = None
+                            if v_info.get("has_audio") is True and fps > 0:
+                                duration_sec = max(1.0 / fps, float(images.shape[0]) / fps)
+                                a_res = subprocess.run(
+                                    [
+                                        ffmpeg, "-v", "error",
+                                        "-i", str(video_path),
+                                        "-map", "0:a:0",
+                                        "-t", str(duration_sec),
+                                        "-f", "f32le", "-acodec", "pcm_f32le",
+                                        "-ac", "2", "-ar", "44100", "-",
+                                    ],
+                                    capture_output=True,
+                                    timeout=60,
+                                )
+                                if a_res.returncode == 0 and len(a_res.stdout) >= 8:
+                                    a_samples = torch.frombuffer(
+                                        bytearray(a_res.stdout[: (len(a_res.stdout) // 8) * 8]),
+                                        dtype=torch.float32,
+                                    )
+                                    if a_samples.numel() >= 2:
+                                        waveform = a_samples.reshape(-1, 2).T.contiguous().unsqueeze(0)
+                                        audio_dict = {"waveform": waveform, "sample_rate": 44100}
+                            return images, audio_dict, f"rendered_video:{video_path.name}"
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to decode next-segment head video %s: %s",
+                            video_path,
+                            exc,
+                        )
+
+    if allow_timeline_fallback and tracks_info is not None:
+        try:
+            info = parse_tracks_info(tracks_info)
+            next_img = _resolve_task_entry_image(info, next_index, pick_last=False, min_unmuted_count=1)
+            if next_img is not None:
+                return (
+                    _degrain_context_suffix(next_img, strength=degrain_strength),
+                    None,
+                    f"next_segment_image:{next_index}",
+                )
+            curr_last_img = _resolve_task_entry_image(
+                info,
+                int(current_segment_index),
+                pick_last=True,
+                min_unmuted_count=2,
+            )
+            if curr_last_img is not None:
+                return (
+                    _degrain_context_suffix(curr_last_img, strength=degrain_strength),
+                    None,
+                    f"current_segment_last_image:{int(current_segment_index)}",
+                )
+        except Exception as exc:
+            logger.warning("Failed to resolve timeline fallback image for bridge segment: %s", exc)
+
+    return None, None, "none"
 
 
 def clear_h3_project_segments_from(
