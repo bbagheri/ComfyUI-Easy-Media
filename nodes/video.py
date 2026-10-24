@@ -238,11 +238,20 @@ class EasySaveVideo(io.ComfyNode):
                 metadata=metadata,
             )
 
+        saved_video_ref = InputImpl.VideoFromFile(full_path)
+        del source_video
+        if "images" in locals():
+            del images
+        if "normalized" in locals():
+            del normalized
+        import gc
+        gc.collect()
+
         if hide_preview:
-            return io.NodeOutput(source_video, relative_path)
+            return io.NodeOutput(saved_video_ref, relative_path)
 
         return io.NodeOutput(
-            source_video,
+            saved_video_ref,
             relative_path,
             ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, folder_type)]),
         )

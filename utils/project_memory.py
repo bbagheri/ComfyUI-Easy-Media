@@ -136,6 +136,10 @@ def _after_project_node(execution_list: Any, node_id: str) -> None:
     removed = _release_saved_outputs(execution_list, owner, state)
     if removed:
         gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         # Release unused allocator blocks only; model residency remains under
         # ComfyUI's model manager and is not changed by segment cache eviction.
         from comfy import model_management

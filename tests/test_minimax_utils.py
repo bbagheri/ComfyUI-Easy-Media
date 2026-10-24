@@ -132,3 +132,24 @@ def test_selflift_transition_step_rejects_invalid_boundaries(step_count, ratio):
 
     with pytest.raises(ValueError):
         module.selflift_transition_step(step_count, ratio)
+
+
+def test_degrain_context_suffix_damps_micro_grain_and_preserves_edges():
+    module = _load_minimax_utils()
+    torch.manual_seed(42)
+    base = torch.full((5, 32, 32, 3), 0.5, dtype=torch.float32)
+    # Add low-amplitude high-frequency checkerboard grain
+    checker = (
+        (torch.arange(32).view(-1, 1) + torch.arange(32).view(1, -1)) % 2 * 2 - 1
+    ).float() * 0.012
+    noisy = base + checker.view(1, 32, 32, 1)
+    cleaned = module._degrain_context_suffix(noisy)
+    assert (cleaned - base).pow(2).mean() < (noisy - base).pow(2).mean() * 0.35
+
+    # Verify sharp high-contrast step edge is preserved (>99%)
+    step_img = torch.zeros((5, 32, 32, 3), dtype=torch.float32)
+    step_img[:, :, 16:, :] = 0.85
+    cleaned_edge = module._degrain_context_suffix(step_img)
+    edge_diff = (cleaned_edge[:, :, 16, :] - cleaned_edge[:, :, 15, :]).mean().item()
+    assert edge_diff > 0.84
+

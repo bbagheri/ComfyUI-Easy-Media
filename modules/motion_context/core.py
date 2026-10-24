@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 
 LOGGER = logging.getLogger("easy_media.h3_motion_context")
@@ -218,6 +220,54 @@ def _audio_tail_from_latent(
     )
 
 
+def _sanitize_context_video_latent(video: torch.Tensor) -> torch.Tensor:
+    """Damp high-frequency latent checkerboard grain and soft-clamp >4 sigma spikes."""
+    if (
+        not isinstance(video, torch.Tensor)
+        or video.ndim != 5
+        or not torch.is_floating_point(video)
+        or int(video.shape[3]) < 8
+        or int(video.shape[4]) < 8
+    ):
+        return video
+
+    try:
+        strength = float(
+            os.environ.get("EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH", "0.25")
+        )
+    except (TypeError, ValueError):
+        strength = 0.25
+    alpha = max(0.0, min(1.0, strength))
+    if alpha <= 0.0:
+        return video
+
+    orig_dtype = video.dtype
+    x = video.float()
+    b, c, t, h, w = x.shape
+    # 1. Per-channel soft-knee outlier clamp above 3.8 sigma to stop variance creep
+    mean = x.mean(dim=(2, 3, 4), keepdim=True)
+    std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+    z = (x - mean) / std
+    knee = 3.8
+    excess = (z.abs() - knee).clamp(min=0.0)
+    z_clamped = z.sign() * (
+        z.abs().clamp(max=knee) + torch.tanh(excess * 0.5) * 2.0
+    )
+    x = mean + z_clamped * std
+
+    # 2. Edge-preserving spatial high-frequency damping across (H_lat, W_lat)
+    flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
+    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
+    padded = F.pad(flat, (1, 1, 1, 1), mode="reflect")
+    blurred = F.conv2d(padded, kernel_2d, groups=c)
+    delta = flat - blurred
+    tau_sq = (0.35 * std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)).square()
+    weight = torch.exp(-delta.square() / (2.0 * tau_sq))
+    cleaned = flat - (alpha * weight) * delta
+    return cleaned.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4).to(dtype=orig_dtype).contiguous()
+
+
 def trim_motion_context_latent(
     latent: dict[str, Any],
     context_length: int | str = "22",
@@ -226,7 +276,7 @@ def trim_motion_context_latent(
     frame_count = int(context_length)
     video, start, steps, covered = _video_tail_bounds(latent, frame_count)
     audio, _, _ = _audio_tail_from_latent(latent, covered)
-    video = video[:1, :, start : start + steps].detach()
+    video = _sanitize_context_video_latent(video[:1, :, start : start + steps].detach())
     streams = tuple(
         stream.detach().to(device="cpu", copy=True).contiguous()
         for stream in (video, audio)
@@ -239,7 +289,9 @@ def trim_motion_context_latent(
                 "easy h3 motion context: anchor_samples must be a video latent"
             )
         output["anchor_samples"] = (
-            anchor_samples.detach().to(device="cpu", copy=True).contiguous()
+            _sanitize_context_video_latent(anchor_samples.detach())
+            .to(device="cpu", copy=True)
+            .contiguous()
         )
     return output
 
