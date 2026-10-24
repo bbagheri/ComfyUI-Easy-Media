@@ -1142,6 +1142,14 @@ class EasyH3MotionContextLatentTrim(io.ComfyNode):
                     options=["5", "22", "39", "56"],
                     default="22",
                 ),
+                io.Float.Input(
+                    "degrain_strength",
+                    default=0.65,
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    optional=True,
+                ),
             ],
             outputs=[io.Latent.Output("context_latent")],
             is_dev_only=True,
@@ -1154,7 +1162,11 @@ class EasyH3MotionContextLatentTrim(io.ComfyNode):
         context_length: str = "22",
         anchor_images: torch.Tensor | None = None,
         vae: Any | None = None,
+        degrain_strength: float | None = None,
     ) -> io.NodeOutput:
+        if degrain_strength is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(float(degrain_strength))
+            os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(float(degrain_strength))
         output = trim_motion_context_latent(latent, context_length=context_length)
         if (anchor_images is None) != (vae is None):
             raise ValueError("anchor_images and vae must be connected together")
@@ -2194,6 +2206,14 @@ class EasyH3ContextMediaTrim(io.ComfyNode):
                     max=240.0,
                     step=0.001,
                 ),
+                io.Float.Input(
+                    "degrain_strength",
+                    default=0.65,
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    optional=True,
+                ),
             ],
             outputs=[
                 io.Image.Output("images"),
@@ -2213,7 +2233,11 @@ class EasyH3ContextMediaTrim(io.ComfyNode):
         phase_align_video_encode: bool = False,
         fit_video_duration: bool = False,
         fps: float = 24.0,
+        degrain_strength: float | None = None,
     ) -> io.NodeOutput:
+        if degrain_strength is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(float(degrain_strength))
+            os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(float(degrain_strength))
         prefix = max(0, int(trim_frames))
         wanted_frames = max(1, int(output_frames))
         if bool(phase_align_video_encode):

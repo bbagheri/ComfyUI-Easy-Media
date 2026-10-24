@@ -60,24 +60,45 @@ def _degrain_context_suffix(
         except (TypeError, ValueError):
             threshold = H3_DEFAULT_CONTEXT_DEGRAIN_THRESHOLD
 
-    alpha = max(0.0, min(1.0, float(strength)))
-    tau = float(threshold)
-    if alpha <= 0.0 or tau <= 0.0:
+    scale = max(0.0, min(2.0, float(strength)))
+    base_tau = float(threshold)
+    if scale <= 0.0 or base_tau <= 0.0:
         return images
 
     orig_dtype = images.dtype
     # [T, H, W, C] -> [T, C, H, W]
     x = images.permute(0, 3, 1, 2).float()
     channels = int(x.shape[1])
-    kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
-    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 3, 3).expand(channels, 1, 3, 3).contiguous()
-    padded = F.pad(x, (1, 1, 1, 1), mode="reflect")
-    blurred = F.conv2d(padded, kernel_2d, groups=channels)
-    delta = x - blurred
     rgb_channels = min(3, channels)
-    diff_sq = delta[:, :rgb_channels].square().mean(dim=1, keepdim=True)
-    weight = torch.exp(-diff_sq / (2.0 * tau * tau))
-    cleaned = x - (alpha * weight) * delta
+    kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
+    kernel_2d = (
+        torch.outer(kernel_1d, kernel_1d)
+        .view(1, 1, 3, 3)
+        .expand(channels, 1, 3, 3)
+        .contiguous()
+    )
+
+    # Pass 1: 3x3 fine-grain bilateral filter (1px solver noise)
+    alpha_1 = min(0.95, scale)
+    tau_1 = base_tau * max(0.85, scale / H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH)
+    padded_1 = F.pad(x, (1, 1, 1, 1), mode="reflect")
+    blurred_1 = F.conv2d(padded_1, kernel_2d, groups=channels)
+    delta_1 = x - blurred_1
+    diff_sq_1 = delta_1[:, :rgb_channels].square().mean(dim=1, keepdim=True)
+    weight_1 = torch.exp(-diff_sq_1 / (2.0 * tau_1 * tau_1))
+    cleaned = x - (alpha_1 * weight_1) * delta_1
+
+    # Pass 2: 5x5 dilated bilateral filter (2-3px clumped mid-frequency stippling in 10+ segment runs)
+    if scale > 0.70 and int(images.shape[1]) >= 16 and int(images.shape[2]) >= 16:
+        alpha_2 = min(0.85, (scale - 0.65) * 0.85)
+        tau_2 = tau_1 * 1.15
+        padded_2 = F.pad(cleaned, (2, 2, 2, 2), mode="reflect")
+        blurred_2 = F.conv2d(padded_2, kernel_2d, groups=channels, dilation=2)
+        delta_2 = cleaned - blurred_2
+        diff_sq_2 = delta_2[:, :rgb_channels].square().mean(dim=1, keepdim=True)
+        weight_2 = torch.exp(-diff_sq_2 / (2.0 * tau_2 * tau_2))
+        cleaned = cleaned - (alpha_2 * weight_2) * delta_2
+
     return cleaned.permute(0, 2, 3, 1).to(dtype=orig_dtype).contiguous()
 
 

@@ -220,8 +220,11 @@ def _audio_tail_from_latent(
     )
 
 
-def _sanitize_context_video_latent(video: torch.Tensor) -> torch.Tensor:
-    """Damp high-frequency latent checkerboard grain and soft-clamp >4 sigma spikes."""
+def _sanitize_context_video_latent(
+    video: torch.Tensor,
+    strength: float | None = None,
+) -> torch.Tensor:
+    """Damp high-frequency latent checkerboard grain, soft-clamp spikes, and anchor std."""
     if (
         not isinstance(video, torch.Tensor)
         or video.ndim != 5
@@ -231,40 +234,55 @@ def _sanitize_context_video_latent(video: torch.Tensor) -> torch.Tensor:
     ):
         return video
 
-    try:
-        strength = float(
-            os.environ.get("EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH", "0.25")
-        )
-    except (TypeError, ValueError):
-        strength = 0.25
-    alpha = max(0.0, min(1.0, strength))
-    if alpha <= 0.0:
+    if strength is None:
+        try:
+            strength = float(
+                os.environ.get(
+                    "EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH",
+                    os.environ.get("EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH", "0.65"),
+                )
+            )
+        except (TypeError, ValueError):
+            strength = 0.65
+    scale = max(0.0, min(2.0, float(strength)))
+    if scale <= 0.0:
         return video
 
     orig_dtype = video.dtype
     x = video.float()
     b, c, t, h, w = x.shape
-    # 1. Per-channel soft-knee outlier clamp above 3.8 sigma to stop variance creep
+    # 1. Per-channel soft-knee outlier clamp to stop variance spikes
     mean = x.mean(dim=(2, 3, 4), keepdim=True)
     std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
     z = (x - mean) / std
-    knee = 3.8
+    knee = max(2.8, 3.8 - 0.5 * max(0.0, scale - 0.65))
     excess = (z.abs() - knee).clamp(min=0.0)
     z_clamped = z.sign() * (
-        z.abs().clamp(max=knee) + torch.tanh(excess * 0.5) * 2.0
+        z.abs().clamp(max=knee) + torch.tanh(excess * 0.5) * 1.8
     )
     x = mean + z_clamped * std
 
-    # 2. Edge-preserving spatial high-frequency damping across (H_lat, W_lat)
+    # 2. Global std inflation anchor (prevents 0.97 -> 1.12 std creep across 10+ segments)
+    global_std = x.std().clamp(min=1e-5)
+    target_std = 0.985
+    if global_std > target_std:
+        std_pull = min(0.85, 0.45 * (scale / 0.65))
+        anchored_std = target_std + (global_std - target_std) * (1.0 - std_pull)
+        x = mean + (x - mean) * (anchored_std / global_std)
+        std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+
+    # 3. Edge-preserving spatial high-frequency damping across (H_lat, W_lat)
+    alpha_lat = min(0.75, 0.25 * (scale / 0.65))
     flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
     kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
     kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
     padded = F.pad(flat, (1, 1, 1, 1), mode="reflect")
     blurred = F.conv2d(padded, kernel_2d, groups=c)
     delta = flat - blurred
-    tau_sq = (0.35 * std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)).square()
+    tau_factor = 0.35 * max(0.85, scale / 0.65)
+    tau_sq = (tau_factor * std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)).square()
     weight = torch.exp(-delta.square() / (2.0 * tau_sq))
-    cleaned = flat - (alpha * weight) * delta
+    cleaned = flat - (alpha_lat * weight) * delta
     return cleaned.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4).to(dtype=orig_dtype).contiguous()
 
 

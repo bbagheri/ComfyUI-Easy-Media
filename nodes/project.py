@@ -199,16 +199,22 @@ def _h3_encode_context_media(
     audio_vae: Any,
     node_prefix: str,
     context_frames: int = 22,
+    degrain_strength: float | None = None,
 ) -> Any:
     """Encode a phase-aligned video suffix and the delivered audio timeline."""
+    trim_kwargs: dict[str, Any] = {
+        "images": images,
+        "audio": audio,
+        "trim_frames": 0,
+        "output_frames": int(context_frames),
+        "phase_align_video_encode": True,
+    }
+    if degrain_strength is not None:
+        trim_kwargs["degrain_strength"] = float(degrain_strength)
     video_tail = graph.node(
         "easy h3ContextMediaTrim",
         id=f"{node_prefix}_encode_trim",
-        images=images,
-        audio=audio,
-        trim_frames=0,
-        output_frames=int(context_frames),
-        phase_align_video_encode=True,
+        **trim_kwargs,
     )
     encoded_video = graph.node(
         "VAEEncode",
@@ -1026,6 +1032,21 @@ class EasyMultiTrackProject(io.ComfyNode):
                     ],
                     tooltip="Enable shared high-resolution H3 spatial tiling.",
                 ),
+                io.Float.Input(
+                    "context_degrain_strength",
+                    default=0.65,
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    round=0.01,
+                    extra_dict={"precision": 2},
+                    optional=True,
+                    tooltip=(
+                        "Inter-segment context de-graining and latent variance "
+                        "stabilization strength (0.0 = disabled, 0.65 = default, "
+                        "1.0-1.5 = strong multi-scale de-graining for 10+ segment runs)."
+                    ),
+                ),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[
@@ -1125,6 +1146,14 @@ class EasyMultiTrackProject(io.ComfyNode):
                 _first_input(kwargs.get("disable_2nd_noise"), False),
             )
         )
+        context_degrain_strength = float(
+            _first_input(
+                sampling_config.get("context_degrain_strength"),
+                _first_input(kwargs.get("context_degrain_strength"), 0.65),
+            )
+        )
+        os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(context_degrain_strength)
+        os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(context_degrain_strength)
         second_model = model
         second_model_loader = None
         if run_second_pass or is_selflift:
@@ -1504,12 +1533,14 @@ class EasyMultiTrackProject(io.ComfyNode):
                 context_latent = _h3_encode_context_media(
                     graph, passthrough.out(1), passthrough.out(2), vae, audio_vae,
                     f"passthrough_context_{task_index}",
+                    degrain_strength=context_degrain_strength,
                 )
                 runtime_context_latent = graph.node(
                     "easy h3MotionContextLatentTrim",
                     id=f"trim_hires_context_latent_{task_index}",
                     latent=context_latent,
                     context_length=str(H3_CONTEXT_SOURCE_FRAMES),
+                    degrain_strength=context_degrain_strength,
                 ).out(0)
                 saved_video_end = graph.node(
                     "easy h3SegmentSaveEnd",
@@ -2112,6 +2143,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         vae,
                         audio_vae,
                         f"hires_context_{task_index}",
+                        degrain_strength=context_degrain_strength,
                     )
                     hires_context_reencoded = True
                     if (has_second_pass and run_second_pass) or (
@@ -2155,6 +2187,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                             vae,
                             audio_vae,
                             f"low_context_{task_index}",
+                            degrain_strength=context_degrain_strength,
                         )
                         low_context_reencoded = True
                     else:
@@ -2192,6 +2225,7 @@ class EasyMultiTrackProject(io.ComfyNode):
             hires_trim_inputs: dict[str, Any] = {
                 "latent": saved_hires_context_latent,
                 "context_length": str(context_source_frames),
+                "degrain_strength": context_degrain_strength,
             }
             if not audio_only and not hires_context_reencoded:
                 hires_trim_inputs.update({"anchor_images": output_images, "vae": vae})
@@ -2204,6 +2238,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                 low_trim_inputs: dict[str, Any] = {
                     "latent": saved_low_context_latent,
                     "context_length": str(context_source_frames),
+                    "degrain_strength": context_degrain_strength,
                 }
                 if not audio_only and not low_context_reencoded:
                     low_anchor_images = low_delivered_images
