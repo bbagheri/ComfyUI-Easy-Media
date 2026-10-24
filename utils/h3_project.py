@@ -848,9 +848,10 @@ def initialize_h3_project(
     if not isinstance(manifest.get("segments"), dict):
         manifest["segments"] = {}
     new_task_ids = _h3_task_ids(info)
+    compact_segments = compact_h3_task_segments(info)
     new_continuity_modes = [
-        _h3_continuity_mode(entry)
-        for entry in h3_task_entries(info)
+        str(seg.get("continuity_mode", "shot"))
+        for seg in compact_segments
     ]
     _reconcile_shifted_project_segments(
         project_dir,
@@ -865,7 +866,7 @@ def initialize_h3_project(
             "width": info["width"],
             "height": info["height"],
             "fps": info["frame_rate"],
-            "task_segments": compact_h3_task_segments(info),
+            "task_segments": compact_segments,
         }
     )
     manifest.pop("tracks_info", None)
