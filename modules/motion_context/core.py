@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -588,13 +589,115 @@ def _hard_av_latent(
     return output
 
 
+def _resolve_context_reset_denoise(reset_denoise: float | None = None) -> float:
+    if reset_denoise is None:
+        try:
+            reset_denoise = float(
+                os.environ.get("EASYMEDIA_H3_CONTEXT_RESET_DENOISE", "0.0")
+            )
+        except (TypeError, ValueError):
+            reset_denoise = 0.0
+    return max(0.0, min(1.0, float(reset_denoise)))
+
+
+def _extract_ref_video_stats(
+    conditioning: Any,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Extract average per-channel mean/std from clean <Picture N> minimax_refs latents."""
+    if not isinstance(conditioning, (list, tuple)):
+        return None
+    means: list[torch.Tensor] = []
+    stds: list[torch.Tensor] = []
+    for item in conditioning:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        meta = item[1]
+        if not isinstance(meta, dict):
+            continue
+        for ref in meta.get("minimax_refs") or ():
+            if not isinstance(ref, dict):
+                continue
+            lat = ref.get("latent")
+            if (
+                isinstance(lat, torch.Tensor)
+                and lat.ndim in (4, 5)
+                and int(lat.shape[1] if lat.ndim == 5 else lat.shape[0]) == 24
+                and int(lat.shape[-2]) >= 8
+                and int(lat.shape[-1]) >= 8
+            ):
+                x = lat.unsqueeze(0) if lat.ndim == 4 else lat[:1]
+                x = x.detach().float()
+                means.append(x.mean(dim=(2, 3, 4), keepdim=True))
+                stds.append(x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5))
+    if not means:
+        return None
+    ref_mean = torch.stack(means, dim=0).mean(dim=0)
+    ref_std = torch.stack(stds, dim=0).mean(dim=0)
+    return ref_mean, ref_std
+
+
+def _reset_context_blocks_to_ref(
+    blocks: list[torch.Tensor],
+    conditioning: Any = None,
+    reset_denoise: float | None = None,
+) -> list[torch.Tensor]:
+    """Anchor context blocks to clean reference stats and strip HF grain so minimax_refs supplies texture."""
+    r = _resolve_context_reset_denoise(reset_denoise)
+    if r <= 0.0 or not blocks:
+        return blocks
+    first = blocks[0]
+    if (
+        not isinstance(first, torch.Tensor)
+        or first.ndim != 5
+        or int(first.shape[3]) < 8
+        or int(first.shape[4]) < 8
+    ):
+        return blocks
+
+    orig_dtype = first.dtype
+    cat = torch.cat(blocks, dim=2).float()
+    b, c, t, h, w = cat.shape
+    ctx_mean = cat.mean(dim=(2, 3, 4), keepdim=True)
+    ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+
+    # 1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs
+    ref_stats = _extract_ref_video_stats(conditioning)
+    if ref_stats is not None:
+        ref_mean, ref_std = ref_stats
+        ref_mean = ref_mean.to(device=cat.device, dtype=torch.float32)
+        ref_std = ref_std.to(device=cat.device, dtype=torch.float32)
+        std_blend = min(0.85, r * 1.4)
+        mean_blend = min(0.35, r * 0.5)
+        target_std = ctx_std + std_blend * (ref_std - ctx_std)
+        target_mean = ctx_mean + mean_blend * (ref_mean - ctx_mean)
+        cat = target_mean + (cat - ctx_mean) * (target_std / ctx_std)
+        ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+
+    # 2. Pose-preserving high-frequency strip on minimax_keyframes
+    flat = cat.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    k1 = torch.tensor([0.25, 0.5, 0.25], device=cat.device, dtype=torch.float32)
+    k2 = torch.outer(k1, k1).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
+    low = F.conv2d(F.pad(flat, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
+    high = flat - low
+    tau_sq = (
+        0.75 * ctx_std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)
+    ).square()
+    edge_protect = torch.exp(-high.square() / (2.0 * tau_sq))
+    hf_damping = min(0.80, r * 1.25)
+    cleaned = (flat - (hf_damping * edge_protect) * high).reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    cleaned = cleaned.to(dtype=orig_dtype).contiguous()
+    return [cleaned[:, :, idx : idx + 1].clone() for idx in range(t)]
+
+
 def _reencoded_anchor_av_latent(
     latent: dict[str, Any],
     anchor_latent: dict[str, Any],
     context_frames: int,
     anchor_frames: int = REENCODED_ANCHOR_FRAMES,
+    reset_denoise: float | None = None,
+    conditioning: Any = None,
 ) -> dict[str, Any]:
-    """Hard-pin a short re-encoded video anchor at the end of a soft prefix."""
+    """Pin a short re-encoded video anchor at the end of a soft prefix, optionally releasing fine texture."""
     context_steps = _steps_for_frames(int(context_frames))
     anchor_video_steps = _steps_for_frames(int(anchor_frames))
     if context_steps is None or anchor_video_steps is None:
@@ -625,6 +728,9 @@ def _reencoded_anchor_av_latent(
         )
 
     blocks, _, covered = _video_tail_from_latent(anchor_latent, int(anchor_frames))
+    r = _resolve_context_reset_denoise(reset_denoise)
+    if r > 0.0 and int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8:
+        blocks = _reset_context_blocks_to_ref(blocks, conditioning=conditioning, reset_denoise=r)
     anchor_video = torch.cat(blocks, dim=2)
     if covered != int(anchor_frames):
         raise RuntimeError("easy h3 anchor context: video anchor span changed")
@@ -642,7 +748,15 @@ def _reencoded_anchor_av_latent(
         dtype=output_video.dtype,
     )
     video_mask = torch.ones_like(output_video[:, :1], dtype=torch.float32)
-    video_mask[:, :, anchor_start:context_steps] = 0.0
+    if r > 0.0 and int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8:
+        # Quantize fractional anchor release to 1/256 so MiniMaxH3._token_grid_masks
+        # and KSamplerX0Inpaint share the exact per-row effective sigma = m * sigma_v.
+        for offset in range(anchor_video_steps):
+            frac = 0.65 + 0.35 * (float(offset) / max(1, anchor_video_steps - 1))
+            m_val = math.ceil(min(1.0, r * frac) * 256.0) / 256.0
+            video_mask[:, :, anchor_start + offset] = m_val
+    else:
+        video_mask[:, :, anchor_start:context_steps] = 0.0
 
     output_audio = target_audio
     audio_mask = torch.ones_like(output_audio[:, :1], dtype=torch.float32)
@@ -691,8 +805,9 @@ def apply_reencoded_anchor_motion_context(
     context_latent: dict[str, Any],
     context_length: int | str = "22",
     anchor_length: int | str = str(REENCODED_ANCHOR_FRAMES),
+    reset_denoise: float | None = None,
 ) -> tuple[Any, int, dict[str, Any]]:
-    """Use long native Motion Context with a short immutable video anchor."""
+    """Use long native Motion Context with a short video anchor."""
     output, trim_frames = apply_motion_context(
         conditioning=conditioning,
         vae=vae,
@@ -700,6 +815,7 @@ def apply_reencoded_anchor_motion_context(
         context_length=context_length,
         audio_context_length=0,
         context_latent=context_latent,
+        reset_denoise=reset_denoise,
     )
     video_keyframes, audio_keyframes = _native_keyframe_stats(output)
     if video_keyframes < 1 or audio_keyframes < 1:
@@ -713,6 +829,8 @@ def apply_reencoded_anchor_motion_context(
         _video_anchor_from_context_latent(context_latent, int(anchor_length)),
         context_frames=int(trim_frames),
         anchor_frames=int(anchor_length),
+        reset_denoise=reset_denoise,
+        conditioning=conditioning,
     )
     return output, trim_frames, anchored
 
@@ -852,8 +970,9 @@ def apply_hires_anchor_continuity(
     previous_hires_latent: dict[str, Any],
     context_length: int | str = "22",
     anchor_length: int | str = str(REENCODED_ANCHOR_FRAMES),
+    reset_denoise: float | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Hard-pin a re-encoded boundary anchor during ordinary hi-res refine."""
+    """Pin a re-encoded boundary anchor during ordinary hi-res refine."""
     output = _reencoded_anchor_av_latent(
         current_hires_latent,
         _video_anchor_from_context_latent(
@@ -862,6 +981,7 @@ def apply_hires_anchor_continuity(
         ),
         context_frames=int(context_length),
         anchor_frames=int(anchor_length),
+        reset_denoise=reset_denoise,
     )
     masks = _streams_from_latent({"samples": output["noise_mask"]})
     samples = _streams_from_latent(output)
@@ -883,6 +1003,7 @@ def apply_motion_context(
     context_latent: dict[str, Any] | None = None,
     audio_vae: Any | None = None,
     context_audio: dict[str, Any] | None = None,
+    reset_denoise: float | None = None,
 ) -> tuple[Any, int]:
     """Attach previous-clip video/audio tails to MiniMax H3 conditioning."""
     target_video = _video_from_latent(latent)
@@ -960,6 +1081,12 @@ def apply_motion_context(
                 "easy h3 motion context: the video VAE temporal grid changed"
             )
         blocks = [encoded[:, :, index : index + 1] for index in range(steps)]
+
+    blocks = _reset_context_blocks_to_ref(
+        blocks,
+        conditioning=conditioning,
+        reset_denoise=reset_denoise,
+    )
 
     keyframes = [
         {

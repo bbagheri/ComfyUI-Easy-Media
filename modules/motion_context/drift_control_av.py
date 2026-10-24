@@ -22,6 +22,8 @@ from .core import (
     _merge_noise_mask,
     _noise_mask_streams,
     _official_nested_tensor,
+    _reset_context_blocks_to_ref,
+    _resolve_context_reset_denoise,
     _streams_from_latent,
     _video_tail_from_latent,
 )
@@ -74,17 +76,19 @@ def matched_noise_ratio(current_sigma: float, sigmas: Any) -> float:
 def temporal_prefix_weights(
     prefix_steps: int,
     taper_steps: int = DRIFT_CONTROL_TAPER_STEPS,
+    seam_floor: float = 0.0,
 ) -> tuple[float, ...]:
-    """Full release at the disposable side, tapered to zero at the seam side."""
+    """Full release at the disposable side, tapered to seam_floor at the seam side."""
     count = int(prefix_steps)
     taper = min(int(taper_steps), count)
+    floor = max(0.0, min(1.0, float(seam_floor)))
     if count < 1:
         raise ValueError("Easy-Media Drift-Control AV prefix steps must be positive")
     if taper < 1:
         raise ValueError("Easy-Media Drift-Control AV taper steps must be positive")
     weights = [1.0] * (count - taper)
     weights.extend(
-        float(taper - offset - 1) / float(taper)
+        floor + (1.0 - floor) * float(taper - offset - 1) / float(taper)
         for offset in range(taper)
     )
     return tuple(weights)
@@ -96,6 +100,7 @@ def apply_dynamic_prefix_mask(
     ratio: float,
     prefix_steps: int,
     taper_steps: int = DRIFT_CONTROL_TAPER_STEPS,
+    seam_floor: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the live schedule-matched mask to the copied video prefix."""
     if not torch.is_tensor(packed_mask) or packed_mask.ndim != 3:
@@ -123,7 +128,7 @@ def apply_dynamic_prefix_mask(
     output = packed_mask.clone()
     video_mask = output[..., :video_elements].reshape(shape)
     weights = torch.tensor(
-        temporal_prefix_weights(prefix_steps, taper_steps),
+        temporal_prefix_weights(prefix_steps, taper_steps, seam_floor=seam_floor),
         device=video_mask.device,
         dtype=video_mask.dtype,
     ).mul_(float(max(0.0, min(1.0, ratio))))
@@ -171,6 +176,7 @@ def prepare_context_swap_latent(
     continue_audio: bool,
     freeze_audio: bool,
     audio_release_steps: int = DRIFT_CONTROL_AUDIO_RELEASE_STEPS,
+    reset_denoise: float | None = None,
 ) -> tuple[dict[str, Any], int, int]:
     """Copy a clean predecessor prefix without modifying the predecessor latent.
 
@@ -210,6 +216,9 @@ def prepare_context_swap_latent(
         context_latent,
         int(context_frames),
     )
+    r = _resolve_context_reset_denoise(reset_denoise)
+    if r > 0.0 and int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8:
+        blocks = _reset_context_blocks_to_ref(blocks, reset_denoise=r)
     copied_video = torch.cat(blocks, dim=2)
     video_steps = int(copied_video.shape[2])
     if covered != int(context_frames):
@@ -297,10 +306,12 @@ class _DriftControlMaskState:
         video_shape: tuple[int, ...],
         sigmas: Any,
         prefix_steps: int,
+        seam_floor: float = 0.0,
     ):
         self.video_shape = tuple(int(value) for value in video_shape)
         self.sigmas = _schedule_values(sigmas)
         self.prefix_steps = int(prefix_steps)
+        self.seam_floor = max(0.0, min(1.0, float(seam_floor)))
         self.current_video_mask: torch.Tensor | None = None
 
     def denoise_mask_function(
@@ -329,6 +340,7 @@ class _DriftControlMaskState:
             matched_noise_ratio(current, schedule),
             prefix_steps=self.prefix_steps,
             taper_steps=min(DRIFT_CONTROL_TAPER_STEPS, self.prefix_steps),
+            seam_floor=self.seam_floor,
         )
         self.current_video_mask = video_mask
         return output
@@ -344,6 +356,7 @@ def install_drift_control_av_model(
     latent: dict[str, Any],
     sigmas: Any,
     prefix_steps: int,
+    reset_denoise: float | None = None,
 ):
     """Clone the H3 model and install sampler/model dynamic-mask hooks."""
     if drift_control_step_count(sigmas) < 1:
@@ -406,6 +419,7 @@ def install_drift_control_av_model(
         tuple(streams[0].shape),
         sigmas,
         prefix_steps,
+        seam_floor=_resolve_context_reset_denoise(reset_denoise),
     )
     patched.set_model_denoise_mask_function(state.denoise_mask_function)
     patched.add_wrapper_with_key(
@@ -426,6 +440,7 @@ def apply_context_swap_drift_control(
     *,
     continue_audio: bool = True,
     freeze_audio: bool = False,
+    reset_denoise: float | None = None,
 ) -> tuple[Any, dict[str, Any], int]:
     """Prepare the disposable AV prefix and return a Drift-Control patched model."""
     prepared, trim_frames, video_steps = prepare_context_swap_latent(
@@ -434,11 +449,13 @@ def apply_context_swap_drift_control(
         int(context_length),
         continue_audio=bool(continue_audio),
         freeze_audio=bool(freeze_audio),
+        reset_denoise=reset_denoise,
     )
     patched_model = install_drift_control_av_model(
         model,
         prepared,
         sigmas,
         prefix_steps=video_steps,
+        reset_denoise=reset_denoise,
     )
     return patched_model, prepared, trim_frames

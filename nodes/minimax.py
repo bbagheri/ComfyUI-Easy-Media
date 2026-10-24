@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -918,6 +919,18 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
                         "internal audio-only project compatibility."
                     ),
                 ),
+                io.Float.Input(
+                    "reset_denoise",
+                    default=0.35,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                    tooltip=(
+                        "Pose-locked shot-texture reset strength (0=hard lock, "
+                        "0.35=reset micro-texture from reference images while keeping pose)."
+                    ),
+                ),
             ],
             outputs=[
                 io.Conditioning.Output("conditioning"),
@@ -937,7 +950,10 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
         video_transition_steps: int = 4,
         audio_transition_steps: int = 4,
         video_anchor_only: bool = True,
+        reset_denoise: float | None = None,
     ) -> io.NodeOutput:
+        if reset_denoise is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
         if video_anchor_only:
             output, trim_frames, hard_latent = (
                 apply_reencoded_anchor_motion_context(
@@ -947,6 +963,7 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
                     context_latent=context_latent,
                     context_length=context_length,
                     anchor_length=str(REENCODED_ANCHOR_FRAMES),
+                    reset_denoise=reset_denoise,
                 )
             )
             return io.NodeOutput(output, trim_frames, hard_latent)
@@ -957,6 +974,7 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
             context_length=context_length,
             audio_context_length=0,
             context_latent=context_latent,
+            reset_denoise=reset_denoise,
         )
         output, trim_frames, hard_latent = build_hard_motion_context(
             conditioning=output,
@@ -1023,6 +1041,14 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                         "continuity, but the default project patch uses ordinary hi-res refine."
                     ),
                 ),
+                io.Float.Input(
+                    "reset_denoise",
+                    default=0.35,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
             ],
             outputs=[
                 io.Model.Output("model"),
@@ -1043,8 +1069,11 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
         seed: int = 0,
         continue_audio: bool = True,
         freeze_audio: bool = False,
+        reset_denoise: float | None = None,
     ) -> io.NodeOutput:
         _ = seed
+        if reset_denoise is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
         patched_model, prepared_latent, trim_frames = (
             apply_context_swap_drift_control(
                 model=model,
@@ -1054,6 +1083,7 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                 context_length=context_length,
                 continue_audio=continue_audio,
                 freeze_audio=freeze_audio,
+                reset_denoise=reset_denoise,
             )
         )
         return io.NodeOutput(patched_model, prepared_latent, trim_frames)
@@ -1087,6 +1117,14 @@ class EasyMiniMaxH3HiResContinuity(io.ComfyNode):
                     max=32,
                 ),
                 io.Boolean.Input("video_anchor_only", default=True),
+                io.Float.Input(
+                    "reset_denoise",
+                    default=0.35,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
             ],
             outputs=[
                 io.Latent.Output("latent"),
@@ -1102,13 +1140,17 @@ class EasyMiniMaxH3HiResContinuity(io.ComfyNode):
         context_length: str = "22",
         video_transition_steps: int = 4,
         video_anchor_only: bool = True,
+        reset_denoise: float | None = None,
     ) -> io.NodeOutput:
+        if reset_denoise is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
         if video_anchor_only:
             output, trim_frames = apply_hires_anchor_continuity(
                 current_hires_latent=current_hires_latent,
                 previous_hires_latent=previous_hires_latent,
                 context_length=context_length,
                 anchor_length=str(REENCODED_ANCHOR_FRAMES),
+                reset_denoise=reset_denoise,
             )
             return io.NodeOutput(output, trim_frames)
         output, trim_frames = apply_hires_continuity(

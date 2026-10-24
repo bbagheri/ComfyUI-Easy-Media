@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 from typing import Any
 
 import folder_paths
@@ -1047,6 +1048,22 @@ class EasyMultiTrackProject(io.ComfyNode):
                         "1.0-1.5 = strong multi-scale de-graining for 10+ segment runs)."
                     ),
                 ),
+                io.Float.Input(
+                    "context_reset_denoise",
+                    default=0.35,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    round=0.01,
+                    extra_dict={"precision": 2},
+                    optional=True,
+                    tooltip=(
+                        "Pose-locked shot-texture reset strength for context and "
+                        "context_drift transitions (0.0 = hard-lock boundary texture, "
+                        "0.35 = default shot-style texture reset from <Picture N> refs "
+                        "while preserving chained pose/motion/audio)."
+                    ),
+                ),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[
@@ -1152,8 +1169,15 @@ class EasyMultiTrackProject(io.ComfyNode):
                 _first_input(kwargs.get("context_degrain_strength"), 0.65),
             )
         )
+        context_reset_denoise = float(
+            _first_input(
+                sampling_config.get("context_reset_denoise"),
+                _first_input(kwargs.get("context_reset_denoise"), 0.35),
+            )
+        )
         os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(context_degrain_strength)
         os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(context_degrain_strength)
+        os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(context_reset_denoise)
         second_model = model
         second_model_loader = None
         if run_second_pass or is_selflift:
@@ -1733,6 +1757,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         seed=(first_pass_seed + task_index) & 0xFFFFFFFFFFFFFFFF,
                         continue_audio=True,
                         freeze_audio=False,
+                        reset_denoise=context_reset_denoise,
                     )
                     first_pass_sampling_model = context_swap.out(0)
                     initial_latent = context_swap.out(1)
@@ -1750,6 +1775,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         video_transition_steps=4,
                         audio_transition_steps=4,
                         video_anchor_only=not audio_only,
+                        reset_denoise=context_reset_denoise,
                     )
                     positive = motion_context.out(0)
                     first_pass_context_trim_frames = motion_context.out(1)
@@ -1956,6 +1982,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         context_length=str(H3_CONTEXT_SOURCE_FRAMES),
                         video_transition_steps=4,
                         video_anchor_only=not audio_only,
+                        reset_denoise=context_reset_denoise,
                     )
                     upscaled_latent = hires_continuity.out(0)
                     context_trim_frames = hires_continuity.out(1)
