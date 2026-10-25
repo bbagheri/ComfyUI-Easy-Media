@@ -74,6 +74,7 @@ The new **continuity mode** determines how a task follows the previous segment. 
 | **Shot (`shot`)** | Generates independently, without inheriting motion or audio context from the previous segment | New shots, scene changes, and deliberate cuts |
 | **Context (`context`)** | Uses the tail of the previous result's audio/video latent to continue motion and sound | Continuous action, long takes, and ongoing audio |
 | **Drift Control Context (`context_drift`)** | In the first pass, applies Drift-Control to the copied video prefix: a denoise mask recalculated for each sampling step allows more change away from the seam and tapers to a fixed boundary. This limits visual drift while carrying motion forward; audio transitions softly. The second pass uses the standard high-resolution anchor without Drift-Control. | Change a subject or appearance while retaining the previous motion |
+| **Bridge (`bridge`)** | Inherits incoming context from segment $N-1$ AND constrains the outgoing post-delivery boundary (`resolved_frame_index = trim_frames + base_task_length`) to segment $N+1$'s opening frames and audio (or timeline `<Picture 1>` fallback). Splicing a Bridge segment into an existing project automatically shifts downstream segment files (`N → N+1`) by timeline UUID. | Splicing a transition segment between two already-rendered segments, or bridging between a context handoff and a target keyframe |
 
 The first segment starts in Shot mode. Set subsequent segments individually or select multiple tasks to change them together. For example, “Shot → Context → Context → Shot” creates three connected segments followed by a new shot. This setting affects **generation**, rather than adding a crossfade during assembly. Context does not guarantee seamless continuity across arbitrary scene or prompt changes.
 
@@ -206,6 +207,10 @@ Both nodes offload ComfyUI's loaded models and clear allocator caches before loc
 | `upscale_by` | Second-pass scale relative to the editor dimensions; default `1.250`, three decimal places, step `0.001` |
 | `disable_2nd_noise` | Disables added second-pass noise; it does not skip the second pass |
 | `1st_pass_only` | In `dual` mode, runs and checkpoints **only the first pass of the first selected segment**. Disable it on the next run to resume that segment at the second pass |
+| `context_degrain_strength` | Strength of bilateral pixel de-graining and latent high-frequency / variance stabilization across context handoffs (`0.0` to `2.0`, default `0.65`) |
+| `context_reset_denoise` | Pose-locked shot-texture reset strength on context prefix boundaries (`0.0` to `1.0`, default `0.35`); lets the diffusion pass regenerate clean surface texture while preserving pose and motion |
+| `end_constraint_mode` | Outgoing boundary constraint mode when regenerating a bounded segment range (`segment_count > 0`) before an existing rendered segment $N+1$: `auto_when_next_exists` (default; active when segment $N+1$ uses `context`, `context_drift`, or `bridge`), `always_when_next_exists`, or `off`. Automatically bypassed during full auto-regressive runs (`segment_count = -1`) |
+| `end_constraint_strength` | Strength of the outgoing post-delivery boundary constraint toward segment $N+1$'s opening frames and audio (`0.0` to `1.0`, default `0.75`) |
 
 Alignment uses Python `round`, matching [the H3 latent upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler/blob/main/nodes/minimax_h3_latent_upscaler_3d.py); it is not always upward, and exact ties round to the even integer. For example, `1344 × 768` at `1.250` becomes `1680 × 960` before alignment and **`1664 × 960`** for the second pass. Both upscaling paths use this size, and project records and combined exports retain the resulting dimensions. Single-pass generation and first-pass-only previews keep the editor dimensions; audio-only projects (`32 × 32`) do not upscale. Existing workflows retain their saved multiplier rather than automatically adopting the new default.
 
@@ -271,7 +276,7 @@ If the next segment needs a specific new framing rather than whatever the previo
 | `project_save = new` | Preserves existing results in the same project and adds versions for regenerated segments, allowing comparison |
 | `project_save = override` | Replaces the corresponding segment version. With `segment_count = -1`, clears saved segments from the start onward before regeneration; a first-pass checkpoint being resumed is preserved |
 
-For example, to regenerate only segment 3, set `segment_start_number = 3` and `segment_count = 1`. Choose `project_save = new` to retain the old result for comparison. If segment 3 uses Context, the project must contain compatible context from segment 2. After accepting the new segment 3, regenerate any later Context segments that depend on it.
+For example, to regenerate only segment 3, set `segment_start_number = 3` and `segment_count = 1`. Choose `project_save = new` to retain the old result for comparison. If segment 3 uses Context, the project must contain compatible context from segment 2. When segment 4 already has a rendered video and `end_constraint_mode` is `auto_when_next_exists` (or `always_when_next_exists`), regenerating segment 3 automatically constrains both its incoming boundary (from segment 2) and its outgoing boundary + audio (into segment 4). Standard auto-regressive generation (`segment_count = -1`) remains 100% backward-compatible and never attaches outgoing constraints against older segment videos on disk.
 
 <a id="multitrack-project-video-combine"></a>
 
