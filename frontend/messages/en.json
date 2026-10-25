@@ -60,7 +60,7 @@
     "unmutePreview": "Unmute preview audio",
     "combine": "Combine",
     "autoCombine": "Auto combine",
-    "clipLabel": "Segment {number}",
+    "clipLabel": "{number}",
     "clipContinuity": "{mode}",
     "selectClipFile": "Select a file for segment {number}",
     "selectClipFiles": "Select up to two videos for segment {number}",
@@ -120,7 +120,7 @@
     "edit": "Edit"
   },
   "multitrackSegment": {
-    "taskLabel": "Segment {n} {mode}"
+    "taskLabel": "{n}"
   },
   "multitrack": {
     "audio": "Audio",

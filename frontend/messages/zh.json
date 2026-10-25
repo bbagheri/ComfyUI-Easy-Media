@@ -60,7 +60,7 @@
     "unmutePreview": "开启预览声音",
     "combine": "合并",
     "autoCombine": "自动合并",
-    "clipLabel": "片段{number}",
+    "clipLabel": "{number}",
     "clipContinuity": "{mode}",
     "selectClipFile": "选择片段{number}的视频文件",
     "selectClipFiles": "为片段{number}选择最多两个视频",
@@ -120,7 +120,7 @@
     "edit": "编辑"
   },
   "multitrackSegment": {
-    "taskLabel": "片段 {n} {mode}"
+    "taskLabel": "{n}"
   },
   "multitrack": {
     "audio": "音频",

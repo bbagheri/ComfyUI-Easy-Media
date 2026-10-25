@@ -142,7 +142,7 @@ If an older workflow connects directly to the editor's media outputs, insert `Mu
 
 #### v1.3.x Task and Audio Settings
 
-- **Task track:** Adds Shot / Context / Character Swap Context continuity modes. Select multiple task segments to change their task mode, continuity mode, and reference image size together.
+- **Task track:** Adds Shot / Context / Character Swap Context / Bridge continuity modes. Select multiple task segments to change their task mode, continuity mode, and reference image size together. Timeline segment blocks use compact numeric labels (`1`, `2`, …) without duration overlays to keep narrow segments readable.
 - **Lock audio:** In MultiTrack Project, the input audio constrains visual generation, and the delivered video uses the original task audio instead of regenerating it. This differs from using audio only as a reference.
 - **Reuse audio:** Share the same reference audio across tasks without copying it under every segment. Up to 15 seconds are used, without truncating it to a shorter task duration.
 
@@ -300,7 +300,7 @@ After regenerating with `project_save = new`, click a timeline segment to open i
 2. **Select two videos:** Enter synchronized comparison to review results from different seeds, prompts, or sampling settings. Each segment allows at most two selected versions at a time.
 3. **Keep one after comparing:** Deselect the unwanted version, then combine manually. Selecting two is only for comparison: assembly still uses the primary version (the first in the current selection list), not the comparison layout or both versions together.
 
-Segments display their Shot / Context mode to help review joins. Selecting an older version changes the assembled clip but does not repair already-generated downstream context. If versions end with different motion or audio, regenerate the affected later segments. Deleting a segment version or an entire project also deletes associated files and context; make sure they are no longer needed for resuming.
+Segments are labeled with compact 1-based numbers (`1`, `2`, …) and display their Shot / Context / Bridge mode to help review joins. Selecting an older version changes the assembled clip but does not repair already-generated downstream context. If versions end with different motion or audio, regenerate the affected later segments. Deleting a segment version or an entire project also deletes associated files and context; make sure they are no longer needed for resuming.
 
 > **Scope:** This node is for video projects. Audio-only projects with editor dimensions set to `32 × 32` cannot use it to combine video.
 

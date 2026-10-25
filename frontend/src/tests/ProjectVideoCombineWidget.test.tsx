@@ -622,7 +622,7 @@ describe('ProjectVideoCombineWidget', () => {
 
     render(<ProjectVideoCombineWidget {...props} />)
 
-    expect(screen.getByText('Segment 1')).not.toBeNull()
+    expect(screen.getByText('1')).not.toBeNull()
     expect(screen.getByText('Shot')).not.toBeNull()
     expect(screen.queryByRole('combobox', { name: 'Select a file for segment 1' })).toBeNull()
   })
@@ -630,16 +630,16 @@ describe('ProjectVideoCombineWidget', () => {
   it('keeps timeline content mounted while hiding and showing the track area', () => {
     const { props } = widgetProps()
     render(<ProjectVideoCombineWidget {...props} />)
-    const segmentLabel = screen.getByText('Segment 1')
+    const segmentLabel = screen.getByText('1')
 
     fireEvent.click(screen.getByRole('button', { name: 'Hide timeline' }))
 
     expect(segmentLabel.isConnected).toBe(true)
-    expect(screen.getByText('Segment 1')).toBe(segmentLabel)
+    expect(screen.getByText('1')).toBe(segmentLabel)
 
     fireEvent.click(screen.getByRole('button', { name: 'Show timeline' }))
 
-    expect(screen.getByText('Segment 1')).toBe(segmentLabel)
+    expect(screen.getByText('1')).toBe(segmentLabel)
   })
 
   it('allows selecting two videos for comparison and promotes the remaining video for output', () => {
@@ -844,7 +844,7 @@ describe('ProjectVideoCombineWidget', () => {
 
     await waitFor(() => expect(props.onChange).toHaveBeenCalledWith({ ...projectData, clips: [], updated_at: 123 }))
     rerender(<ProjectVideoCombineWidget {...props} value={{ ...projectData, clips: [], updated_at: 123 }} />)
-    expect(screen.queryByText('Segment 1')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Select up to two videos for segment 1' })).toBeNull()
   })
 
   it.each([0, 1])('returns to normal preview after deleting comparison video %s', async (deletedIndex) => {

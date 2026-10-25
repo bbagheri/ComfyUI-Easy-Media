@@ -15,7 +15,7 @@ import { AudioWaveform } from '@/components/widgets/timeline/AudioWaveform'
 import { mediaContentToViewUrl } from '@/lib/media-url'
 import { activeTaskImages } from '@/lib/task-image-utils'
 import { useT } from '@/lib/i18n'
-import { formatMultiTrackTime, getMultiTrackTaskModeLabel } from '@/lib/multitrack-utils'
+import { getMultiTrackTaskModeLabel } from '@/lib/multitrack-utils'
 import { getSegmentTrackPresentation } from '@/lib/multitrack-segment-style'
 import { captureVideoPosterFrame } from '@/lib/video-utils'
 import type { SubtitleRecognitionMethod } from '@/lib/subtitle-recognition'
@@ -141,7 +141,6 @@ export function MultiTrackSegmentBlock({
     local_path: segment.content.local_path,
     url: segment.content.url,
   })
-  const segmentDuration = Math.max(0, segment.end_frame - segment.start_frame)
   const sourceDurationFrames = segment.content.duration && segment.content.duration > 0
     ? segment.content.duration * Math.max(frameRate, 1)
     : null
@@ -167,7 +166,6 @@ export function MultiTrackSegmentBlock({
     : trackType === 'subtitle'
       ? segment.content.text ?? t('multitrack.subtitle')
       : segment.content.file_name ?? segment.id
-  const durationLabel = formatMultiTrackTime(segmentDuration, { frameRate, showFrames: true })
   const taskPrompt = segment.content.user_prompt?.trim() ?? ''
   const taskImageUrls = activeTaskImages(segment.content.images).flatMap((image) => {
     const url = mediaContentToViewUrl({
@@ -470,9 +468,6 @@ export function MultiTrackSegmentBlock({
                 >
                   <span className="truncate rounded-sm px-1 font-medium">
                     {label}
-                  </span>
-                  <span className="shrink-0 rounded-sm px-1 tabular-nums">
-                    {durationLabel}
                   </span>
                 </div>
                 {presentation.showThumbnail ? (

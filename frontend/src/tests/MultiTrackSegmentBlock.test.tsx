@@ -176,7 +176,9 @@ describe('MultiTrackSegmentBlock context menu', () => {
   it('offers distribute, clone, merge, split, and delete actions for task segments', () => {
     const { onDelete, onDistribute, onClone, onMerge, onSplitTask } = renderBlock('task')
 
-    expect(screen.getByText(/Segment 1/)).not.toBeNull()
+    expect(screen.getByText('1')).not.toBeNull()
+    expect(screen.queryByText(/Segment/)).toBeNull()
+    expect(screen.queryByText('00:00:05')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Distribute segments evenly' }))
     fireEvent.click(screen.getByRole('button', { name: 'Clone segment' }))
     fireEvent.click(screen.getByRole('button', { name: 'Merge segments' }))
