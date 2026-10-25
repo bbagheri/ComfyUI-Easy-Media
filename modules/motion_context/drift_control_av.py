@@ -91,6 +91,11 @@ def temporal_prefix_weights(
         floor + (1.0 - floor) * float(taper - offset - 1) / float(taper)
         for offset in range(taper)
     )
+    if floor > 0.0 and count >= 2:
+        # Lock the final boundary token (t = count - 1, frames 18..21 immediately preceding
+        # delivered frame 22) tighter than the rest of the prefix so coarse pose and sub-pixel
+        # alignment cannot drift across the cut.
+        weights[-1] = min(floor, min(0.22, 0.48 * floor))
     return tuple(weights)
 
 
@@ -139,14 +144,36 @@ def apply_dynamic_prefix_mask(
     if floor <= 0.0:
         weights = base_weights.mul(clamped_ratio)
     else:
-        # Two-Stage "Pose-Lock -> Full-Release" Re-Materialization Schedule:
-        # Stage 1 (high sigma > sigma_release): lock coarse pose at the 2-token seam (~floor)
-        # while releasing sacrificial early prefix tokens to re-materialize from <Picture 1>.
+        # Two-Stage "Pose-Lock -> Sacrificial-Release / Boundary-Hold" Re-Materialization Schedule:
+        # Stage 1 (high sigma > sigma_release): lock coarse pose at the boundary while releasing
+        # sacrificial early prefix tokens (t = 0..prefix_steps-3) to re-materialize from <Picture 1>.
         # Stage 2 (low sigma <= sigma_release, including final step next_sigma == 0):
-        # ramp denoise_mask smoothly up to 1.0 so KSamplerX0Inpaint synthesizes 100% fresh
-        # facial/anatomical detail instead of blending/overwriting with degraded context.
+        # ramp sacrificial prefix tokens (t = 0..prefix_steps-3) all the way to 1.0 and the bridge
+        # token (t = prefix_steps-2, frame 17) up to ~0.60-0.70, while holding the terminal boundary
+        # token (t = prefix_steps-1, frames 18..21 immediately preceding delivered frame 22) at a
+        # tight ceiling (~0.26-0.31) so KSamplerX0Inpaint preserves exact frame-21 continuity.
         sigma_release = min(0.65, 0.28 + 0.65 * floor)
-        stage1_weights = torch.clamp(base_weights * max(clamped_ratio, 0.80), min=floor, max=1.0)
+        seam_lock = min(floor, min(0.22, 0.48 * floor))
+        stage1_floors = torch.full(
+            (prefix_steps,),
+            floor,
+            device=video_mask.device,
+            dtype=video_mask.dtype,
+        )
+        if prefix_steps >= 2:
+            stage1_floors[-1] = seam_lock
+        stage1_weights = torch.maximum(
+            torch.clamp(base_weights * max(clamped_ratio, 0.80), max=1.0),
+            stage1_floors,
+        )
+        stage2_targets = torch.ones(
+            (prefix_steps,),
+            device=video_mask.device,
+            dtype=video_mask.dtype,
+        )
+        if prefix_steps >= 2:
+            stage2_targets[-2] = min(0.75, max(floor, 0.38 + 0.70 * floor))
+            stage2_targets[-1] = min(0.32, max(seam_lock, 0.14 + 0.42 * floor))
         if current_sigma is not None and math.isfinite(float(current_sigma)):
             curr_s = float(current_sigma)
             next_s = (
@@ -164,7 +191,7 @@ def apply_dynamic_prefix_mask(
                 release_progress = 0.0
         else:
             release_progress = 1.0 if clamped_ratio <= 0.0 else 0.0
-        weights = stage1_weights + (1.0 - stage1_weights) * float(release_progress)
+        weights = stage1_weights + (stage2_targets - stage1_weights) * float(release_progress)
     video_mask[:, :, :prefix_steps] = weights.view(
         1, 1, prefix_steps, 1, 1
     )

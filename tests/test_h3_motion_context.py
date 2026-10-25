@@ -471,22 +471,31 @@ def test_drift_control_two_stage_sigma_release_eliminates_final_step_overwrite()
         seam_floor=0.30,
     )
 
-    # Stage 1 (sigma=1.0 -> 0.75): seam token (t=6) is anchored near seam_floor (~0.30) to lock pose
+    # Stage 1 (sigma=1.0 -> 0.75): terminal seam token (t=6, frames 18..21 before delivered frame 22)
+    # is locked tightly (~0.14-0.16) while bridge token (t=5) sits near ~0.38
     state.denoise_mask_function(torch.tensor(1.0), packed_mask)
+    bridge_high_sigma = float(state.current_video_mask[0, 0, 5, 0, 0])
     seam_high_sigma = float(state.current_video_mask[0, 0, 6, 0, 0])
-    assert 0.28 <= seam_high_sigma <= 0.45
+    assert 0.30 <= bridge_high_sigma <= 0.48
+    assert 0.12 <= seam_high_sigma <= 0.22
 
-    # Stage 2 (sigma=0.25 -> 0.10): seam token ramps upward to release fine detail
+    # Stage 2 (sigma=0.25 -> 0.10): bridge token (t=5) ramps upward while terminal seam token (t=6)
+    # rises gently toward its boundary-hold ceiling (~0.27)
     state.denoise_mask_function(torch.tensor(0.25), packed_mask)
+    bridge_low_sigma = float(state.current_video_mask[0, 0, 5, 0, 0])
     seam_low_sigma = float(state.current_video_mask[0, 0, 6, 0, 0])
-    assert seam_low_sigma > seam_high_sigma + 0.30
+    assert bridge_low_sigma > bridge_high_sigma + 0.12
+    assert seam_high_sigma < seam_low_sigma <= 0.32
 
-    # Final step (sigma=0.10 -> 0.0): full release (1.0) instead of legacy 0.0 overwrite!
+    # Final step (sigma=0.10 -> 0.0): sacrificial prefix tokens (t=0..4) reach full release (1.0),
+    # bridge token (t=5) reaches ~0.59, and terminal seam token (t=6) holds at ~0.27 to prevent any jump!
     state.denoise_mask_function(torch.tensor(0.10), packed_mask)
     assert torch.allclose(
-        state.current_video_mask[:, :, :7],
-        torch.ones_like(state.current_video_mask[:, :, :7]),
+        state.current_video_mask[:, :, :5],
+        torch.ones_like(state.current_video_mask[:, :, :5]),
     )
+    assert 0.55 <= float(state.current_video_mask[0, 0, 5, 0, 0]) <= 0.75
+    assert 0.24 <= float(state.current_video_mask[0, 0, 6, 0, 0]) <= 0.32
 
 
 def test_hires_anchor_continuity_second_pass_blends_pass1_and_boosts_release_mask(
@@ -505,7 +514,10 @@ def test_hires_anchor_continuity_second_pass_blends_pass1_and_boosts_release_mas
     )
     video_mask, audio_mask = output["noise_mask"].tensors
     assert trim_frames == 22
-    # In pass 2 at reset_denoise=0.30, seam tokens (t=5, 6) release above 0.60
+    # In pass 2 at reset_denoise=0.30, bridge token (t=5, frame 17) releases above 0.60,
+    # while terminal seam token (t=6, frames 18..21 before delivered frame 22) stays tightly
+    # locked (~0.27) so delivered frame 22 splices seamlessly with zero boundary jump.
     assert float(video_mask[0, 0, 5, 0, 0]) > 0.60
-    assert float(video_mask[0, 0, 6, 0, 0]) > float(video_mask[0, 0, 5, 0, 0])
+    assert 0.24 <= float(video_mask[0, 0, 6, 0, 0]) <= 0.35
+    assert float(video_mask[0, 0, 6, 0, 0]) < float(video_mask[0, 0, 5, 0, 0])
     assert torch.all(audio_mask == 0)

@@ -711,6 +711,9 @@ def _reset_context_blocks_to_ref(
     ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
 
     # 1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs (or std creep anchor)
+    # Taper the moment shift on the terminal boundary token (t-1, frames 18..21 immediately preceding
+    # delivered frame 22) so the re-materialization color/luminance pull happens inside the discarded
+    # prefix without introducing a brightness or color step right at the segment splice.
     ref_stats = _extract_ref_video_stats(conditioning)
     if ref_stats is not None:
         ref_mean, ref_std = ref_stats
@@ -718,8 +721,16 @@ def _reset_context_blocks_to_ref(
         ref_std = ref_std.to(device=cat.device, dtype=torch.float32)
         std_blend = min(0.85, r * 1.4)
         mean_blend = min(0.35, r * 0.5)
-        target_std = ctx_std + std_blend * (ref_std - ctx_std)
-        target_mean = ctx_mean + mean_blend * (ref_mean - ctx_mean)
+        mean_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
+        std_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
+        if t >= 2:
+            mean_t[:, :, -1] = 0.15
+            std_t[:, :, -1] = 0.50
+        if t >= 3:
+            mean_t[:, :, -2] = 0.70
+            std_t[:, :, -2] = 0.80
+        target_std = ctx_std + (std_blend * std_t) * (ref_std - ctx_std)
+        target_mean = ctx_mean + (mean_blend * mean_t) * (ref_mean - ctx_mean)
         cat = target_mean + (cat - ctx_mean) * (target_std / ctx_std)
         ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
     else:
@@ -744,19 +755,32 @@ def _reset_context_blocks_to_ref(
     z_mid = fine_low - z_low
     z_high = flat - fine_low
 
-    # 3. Position-aware damping (sacrificial early tokens vs. 2-token seam anchor)
+    # 3. Position-aware damping:
+    # - Sacrificial prefix tokens (0 .. t-3, frames 0..16): strong mid+high wipe + orthogonal noise
+    # - Bridge token (t-2, frame 17): intermediate spectral + orthogonal transition
+    # - Terminal seam token (t-1, frames 18..21 immediately before delivered frame 22): preserve
+    #   mid-frequency pose/structure (0.15 * d_mid_seam) and suppress random perturbation (0.12 * eta_seam)
+    #   while still scrubbing 1-cell grain (0.65 * d_high_seam), preventing any jump at the splice.
     d_high_seam = min(0.95, 1.6 * r)
     d_mid_seam = min(0.80, 1.25 * r)
+    eta_seam = min(0.68, 0.90 * r)
     d_high_vec = torch.full((t,), d_high_seam, device=cat.device, dtype=torch.float32)
     d_mid_vec = torch.full((t,), d_mid_seam, device=cat.device, dtype=torch.float32)
-    eta_vec = torch.full((t,), min(0.68, 0.90 * r), device=cat.device, dtype=torch.float32)
+    eta_vec = torch.full((t,), eta_seam, device=cat.device, dtype=torch.float32)
     if t > 2:
         sac_count = t - 2
         for idx in range(sac_count):
             sac_progress = 1.0 - (float(idx) / float(max(1, sac_count)))
             d_high_vec[idx] = min(0.98, d_high_seam + 0.30 * sac_progress)
             d_mid_vec[idx] = min(0.92, d_mid_seam + 0.30 * sac_progress)
-            eta_vec[idx] = min(0.88, eta_vec[idx] + 0.25 * sac_progress)
+            eta_vec[idx] = min(0.88, eta_seam + 0.25 * sac_progress)
+    if t >= 2:
+        d_high_vec[t - 2] = d_high_seam
+        d_mid_vec[t - 2] = 0.85 * d_mid_seam
+        eta_vec[t - 2] = 0.75 * eta_seam
+        d_high_vec[t - 1] = 0.65 * d_high_seam
+        d_mid_vec[t - 1] = 0.15 * d_mid_seam
+        eta_vec[t - 1] = 0.12 * eta_seam
 
     d_high_bt = d_high_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
     d_mid_bt = d_mid_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
@@ -866,24 +890,37 @@ def _reencoded_anchor_av_latent(
     )
     if is_second_pass and r > 0.0 and has_spatial_room:
         # In pass 2 (sigma_max <= 0.50), target_video already holds the upscaled pass-1 pose.
-        # Blend the reset anchor with the upscaled pass-1 latent so degraded pass-2 history cannot dominate.
-        pass1_blend = min(0.60, 0.90 * r)
-        output_video[:, :, anchor_start:context_steps] = (
-            (1.0 - pass1_blend) * anchor_cast
-            + pass1_blend * output_video[:, :, anchor_start:context_steps]
-        )
+        # Blend the bridge token (t=5, offset=0) toward the upscaled pass-1 latent while keeping
+        # the terminal boundary token (t=6, offset=anchor_video_steps-1, immediately before
+        # delivered frame 22) tightly anchored to the previous high-res segment tail.
+        blend_head = min(0.55, 0.85 * r)
+        blend_tail = min(0.15, 0.25 * r)
+        for offset in range(anchor_video_steps):
+            seam_dist = 1.0 - (float(offset) / max(1, anchor_video_steps - 1))
+            w_pass1 = blend_tail + seam_dist * (blend_head - blend_tail)
+            step_idx = anchor_start + offset
+            output_video[:, :, step_idx : step_idx + 1] = (
+                (1.0 - w_pass1) * anchor_cast[:, :, offset : offset + 1]
+                + w_pass1 * output_video[:, :, step_idx : step_idx + 1]
+            )
     else:
         output_video[:, :, anchor_start:context_steps] = anchor_cast
     video_mask = torch.ones_like(output_video[:, :1], dtype=torch.float32)
     if r > 0.0 and has_spatial_room:
         # Quantize fractional anchor release to 1/256 so MiniMaxH3._token_grid_masks
         # and KSamplerX0Inpaint share the exact per-row effective sigma = m * sigma_v.
+        # Release the earlier anchor buffer token (offset=0, t=5, frame 17) strongly to bridge
+        # from the re-materialized prefix, while tightening the final boundary token (offset=last,
+        # t=6, frames 18..21) so delivered frame 22 splices with zero jump.
         for offset in range(anchor_video_steps):
-            frac = 0.65 + 0.35 * (float(offset) / max(1, anchor_video_steps - 1))
+            seam_dist = 1.0 - (float(offset) / max(1, anchor_video_steps - 1))
             if is_second_pass:
-                raw_m = min(1.0, 0.45 + 0.90 * r * frac)
+                m_head = min(0.85, 0.45 + 0.85 * r)
+                m_tail = min(0.35, 0.12 + 0.50 * r)
             else:
-                raw_m = min(1.0, r * (0.75 + 0.35 * frac) + 0.15 * (r * r))
+                m_head = min(0.85, r * 0.95 + 0.15 * (r * r))
+                m_tail = min(0.32, r * 0.50)
+            raw_m = m_tail + seam_dist * (m_head - m_tail)
             m_val = math.ceil(raw_m * 256.0) / 256.0
             video_mask[:, :, anchor_start + offset] = m_val
     else:
