@@ -636,12 +636,62 @@ def _extract_ref_video_stats(
     return ref_mean, ref_std
 
 
+def _extract_first_ref_latent(
+    conditioning: Any,
+    target_height: int,
+    target_width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Extract the first clean <Picture 1> reference latent token [1, 24, 1, H, W] from minimax_refs."""
+    if not isinstance(conditioning, (list, tuple)):
+        return None
+    for item in conditioning:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        meta = item[1]
+        if not isinstance(meta, dict):
+            continue
+        for ref in meta.get("minimax_refs") or ():
+            if not isinstance(ref, dict):
+                continue
+            lat = ref.get("latent")
+            if (
+                isinstance(lat, torch.Tensor)
+                and lat.ndim in (4, 5)
+                and int(lat.shape[1] if lat.ndim == 5 else lat.shape[0]) == 24
+                and int(lat.shape[-2]) >= 4
+                and int(lat.shape[-1]) >= 4
+            ):
+                x = lat.unsqueeze(0) if lat.ndim == 4 else lat[:1]
+                x = x[:, :, :1].detach().to(device=device, dtype=torch.float32)
+                if int(x.shape[3]) != int(target_height) or int(x.shape[4]) != int(target_width):
+                    x_2d = F.interpolate(
+                        x[:, :, 0],
+                        size=(int(target_height), int(target_width)),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    x = x_2d.unsqueeze(2)
+                return x.to(dtype=dtype).contiguous()
+    return None
+
+
 def _reset_context_blocks_to_ref(
     blocks: list[torch.Tensor],
     conditioning: Any = None,
     reset_denoise: float | None = None,
+    seed: int = 0,
 ) -> list[torch.Tensor]:
-    """Anchor context blocks to clean reference stats and strip HF grain so minimax_refs supplies texture."""
+    """Perform a 3-band spectral pose-only bottleneck + orthogonal Gaussian noise re-materialization reset.
+
+    1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs (or unit-std anchor).
+    2. 3-band spatial decomposition: Coarse Pose Envelope (z_low, >=64px) vs. Mid-Frequency Warping (z_mid)
+       vs. High-Frequency Grain (z_high).
+    3. Position-aware sacrificial prefix disruption (stronger reset on disposable prefix tokens t=0..t-3,
+       optional <Picture 1> seeding at the head) + deterministic orthogonal Gaussian noise injection
+       (eps_perp orthogonalized against the degraded signal) to force fresh feature synthesis from minimax_refs.
+    """
     r = _resolve_context_reset_denoise(reset_denoise)
     if r <= 0.0 or not blocks:
         return blocks
@@ -660,7 +710,7 @@ def _reset_context_blocks_to_ref(
     ctx_mean = cat.mean(dim=(2, 3, 4), keepdim=True)
     ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
 
-    # 1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs
+    # 1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs (or std creep anchor)
     ref_stats = _extract_ref_video_stats(conditioning)
     if ref_stats is not None:
         ref_mean, ref_std = ref_stats
@@ -672,19 +722,84 @@ def _reset_context_blocks_to_ref(
         target_mean = ctx_mean + mean_blend * (ref_mean - ctx_mean)
         cat = target_mean + (cat - ctx_mean) * (target_std / ctx_std)
         ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+    else:
+        global_std = float(cat.std().item())
+        if global_std > 0.985:
+            pull = min(0.75, r * 1.15)
+            anchored_std = 0.985 + (global_std - 0.985) * (1.0 - pull)
+            cat = ctx_mean + (cat - ctx_mean) * (anchored_std / max(1e-5, global_std))
+            ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
 
-    # 2. Pose-preserving high-frequency strip on minimax_keyframes
+    # 2. 3-band spectral decomposition: z_low (coarse pose >= 64px) + z_mid (2..4 cell warping) + z_high (grain)
     flat = cat.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
     k1 = torch.tensor([0.25, 0.5, 0.25], device=cat.device, dtype=torch.float32)
     k2 = torch.outer(k1, k1).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
-    low = F.conv2d(F.pad(flat, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
-    high = flat - low
-    tau_sq = (
-        0.75 * ctx_std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)
-    ).square()
-    edge_protect = torch.exp(-high.square() / (2.0 * tau_sq))
-    hf_damping = min(0.80, r * 1.25)
-    cleaned = (flat - (hf_damping * edge_protect) * high).reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    fine_low = F.conv2d(F.pad(flat, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
+
+    pool_h = max(2, h // 4)
+    pool_w = max(2, w // 4)
+    coarse_pooled = F.adaptive_avg_pool2d(fine_low, (pool_h, pool_w))
+    coarse_up = F.interpolate(coarse_pooled, size=(h, w), mode="bilinear", align_corners=False)
+    z_low = F.conv2d(F.pad(coarse_up, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
+    z_mid = fine_low - z_low
+    z_high = flat - fine_low
+
+    # 3. Position-aware damping (sacrificial early tokens vs. 2-token seam anchor)
+    d_high_seam = min(0.95, 1.6 * r)
+    d_mid_seam = min(0.80, 1.25 * r)
+    d_high_vec = torch.full((t,), d_high_seam, device=cat.device, dtype=torch.float32)
+    d_mid_vec = torch.full((t,), d_mid_seam, device=cat.device, dtype=torch.float32)
+    eta_vec = torch.full((t,), min(0.68, 0.90 * r), device=cat.device, dtype=torch.float32)
+    if t > 2:
+        sac_count = t - 2
+        for idx in range(sac_count):
+            sac_progress = 1.0 - (float(idx) / float(max(1, sac_count)))
+            d_high_vec[idx] = min(0.98, d_high_seam + 0.30 * sac_progress)
+            d_mid_vec[idx] = min(0.92, d_mid_seam + 0.30 * sac_progress)
+            eta_vec[idx] = min(0.88, eta_vec[idx] + 0.25 * sac_progress)
+
+    d_high_bt = d_high_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+    d_mid_bt = d_mid_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+    eta_bt = eta_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+
+    removed = d_mid_bt * z_mid + d_high_bt * z_high
+    retained = z_low + (1.0 - d_mid_bt) * z_mid + (1.0 - d_high_bt) * z_high
+
+    # 4. Deterministic orthogonal Gaussian noise injection in the mid+high band
+    gen = torch.Generator(device="cpu").manual_seed((int(seed) + 0x5A179B) & 0xFFFFFFFFFFFFFFFF)
+    raw_noise = torch.randn((b * t, c, h, w), generator=gen, dtype=torch.float32).to(device=cat.device)
+    noise_coarse = F.interpolate(
+        F.adaptive_avg_pool2d(raw_noise, (pool_h, pool_w)),
+        size=(h, w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    noise_mh = raw_noise - noise_coarse
+    signal_mh = flat - z_low
+    sig_norm_sq = (signal_mh * signal_mh).sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+    proj = (noise_mh * signal_mh).sum(dim=(2, 3), keepdim=True) / sig_norm_sq
+    eps_perp = noise_mh - proj * signal_mh
+    eps_std = eps_perp.std(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+    removed_std = removed.std(dim=(2, 3), keepdim=True)
+    cleaned_flat = retained + eta_bt * removed_std * (eps_perp / eps_std)
+    cleaned = cleaned_flat.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+
+    # 5. Seed <Picture 1> reference distribution into earliest sacrificial prefix blocks (t=0..1)
+    if t >= 5:
+        ref_lat = _extract_first_ref_latent(
+            conditioning,
+            target_height=h,
+            target_width=w,
+            device=cat.device,
+            dtype=torch.float32,
+        )
+        if ref_lat is not None:
+            for idx in range(min(2, t - 3)):
+                w_seed = min(0.65, 1.25 * r) * (1.0 - 0.45 * float(idx))
+                cleaned[:, :, idx : idx + 1] = (
+                    (1.0 - w_seed) * cleaned[:, :, idx : idx + 1] + w_seed * ref_lat
+                )
+
     cleaned = cleaned.to(dtype=orig_dtype).contiguous()
     return [cleaned[:, :, idx : idx + 1].clone() for idx in range(t)]
 
@@ -696,6 +811,7 @@ def _reencoded_anchor_av_latent(
     anchor_frames: int = REENCODED_ANCHOR_FRAMES,
     reset_denoise: float | None = None,
     conditioning: Any = None,
+    is_second_pass: bool = False,
 ) -> dict[str, Any]:
     """Pin a short re-encoded video anchor at the end of a soft prefix, optionally releasing fine texture."""
     context_steps = _steps_for_frames(int(context_frames))
@@ -729,7 +845,8 @@ def _reencoded_anchor_av_latent(
 
     blocks, _, covered = _video_tail_from_latent(anchor_latent, int(anchor_frames))
     r = _resolve_context_reset_denoise(reset_denoise)
-    if r > 0.0 and int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8:
+    has_spatial_room = int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8
+    if r > 0.0 and has_spatial_room:
         blocks = _reset_context_blocks_to_ref(blocks, conditioning=conditioning, reset_denoise=r)
     anchor_video = torch.cat(blocks, dim=2)
     if covered != int(anchor_frames):
@@ -743,17 +860,31 @@ def _reencoded_anchor_av_latent(
             "easy h3 anchor context: anchor and target video latent shapes differ"
         )
     output_video = target_video.clone()
-    output_video[:, :, anchor_start:context_steps] = anchor_video.to(
+    anchor_cast = anchor_video.to(
         device=output_video.device,
         dtype=output_video.dtype,
     )
+    if is_second_pass and r > 0.0 and has_spatial_room:
+        # In pass 2 (sigma_max <= 0.50), target_video already holds the upscaled pass-1 pose.
+        # Blend the reset anchor with the upscaled pass-1 latent so degraded pass-2 history cannot dominate.
+        pass1_blend = min(0.60, 0.90 * r)
+        output_video[:, :, anchor_start:context_steps] = (
+            (1.0 - pass1_blend) * anchor_cast
+            + pass1_blend * output_video[:, :, anchor_start:context_steps]
+        )
+    else:
+        output_video[:, :, anchor_start:context_steps] = anchor_cast
     video_mask = torch.ones_like(output_video[:, :1], dtype=torch.float32)
-    if r > 0.0 and int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8:
+    if r > 0.0 and has_spatial_room:
         # Quantize fractional anchor release to 1/256 so MiniMaxH3._token_grid_masks
         # and KSamplerX0Inpaint share the exact per-row effective sigma = m * sigma_v.
         for offset in range(anchor_video_steps):
             frac = 0.65 + 0.35 * (float(offset) / max(1, anchor_video_steps - 1))
-            m_val = math.ceil(min(1.0, r * frac) * 256.0) / 256.0
+            if is_second_pass:
+                raw_m = min(1.0, 0.45 + 0.90 * r * frac)
+            else:
+                raw_m = min(1.0, r * (0.75 + 0.35 * frac) + 0.15 * (r * r))
+            m_val = math.ceil(raw_m * 256.0) / 256.0
             video_mask[:, :, anchor_start + offset] = m_val
     else:
         video_mask[:, :, anchor_start:context_steps] = 0.0
@@ -971,6 +1102,7 @@ def apply_hires_anchor_continuity(
     context_length: int | str = "22",
     anchor_length: int | str = str(REENCODED_ANCHOR_FRAMES),
     reset_denoise: float | None = None,
+    conditioning: Any = None,
 ) -> tuple[dict[str, Any], int]:
     """Pin a re-encoded boundary anchor during ordinary hi-res refine."""
     output = _reencoded_anchor_av_latent(
@@ -982,6 +1114,8 @@ def apply_hires_anchor_continuity(
         context_frames=int(context_length),
         anchor_frames=int(anchor_length),
         reset_denoise=reset_denoise,
+        conditioning=conditioning,
+        is_second_pass=True,
     )
     masks = _streams_from_latent({"samples": output["noise_mask"]})
     samples = _streams_from_latent(output)
@@ -1088,13 +1222,32 @@ def apply_motion_context(
         reset_denoise=reset_denoise,
     )
 
-    keyframes = [
-        {
-            "resolved_frame_index": position,
-            "latent": block,
-        }
-        for position, block in zip(offsets, blocks)
-    ]
+    r = _resolve_context_reset_denoise(reset_denoise)
+    if (
+        r >= 0.15
+        and len(blocks) > 2
+        and int(target_video.shape[3]) >= 8
+        and int(target_video.shape[4]) >= 8
+    ):
+        # Sacrificial Prefix Disruption: unpin intermediate disposable prefix tokens (t=1..len-3)
+        # from minimax_keyframes so 3D self-attention cannot take a 7:1 copy-paste shortcut from
+        # degraded context tokens, keeping only the <Picture 1>-seeded head (t=0) and 5-frame seam (t=-2,-1).
+        kept_indices = [0, len(blocks) - 2, len(blocks) - 1]
+        keyframes = [
+            {
+                "resolved_frame_index": offsets[idx],
+                "latent": blocks[idx],
+            }
+            for idx in kept_indices
+        ]
+    else:
+        keyframes = [
+            {
+                "resolved_frame_index": position,
+                "latent": block,
+            }
+            for position, block in zip(offsets, blocks)
+        ]
 
     audio_keyframe: dict[str, Any] | None = None
     audio_frames = 0

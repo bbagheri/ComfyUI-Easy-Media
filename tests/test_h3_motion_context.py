@@ -417,3 +417,95 @@ def test_trim_motion_context_latent_keeps_only_detached_cpu_av_tail(
     )
     assert video.untyped_storage().data_ptr() != source_video.untyped_storage().data_ptr()
     assert audio.untyped_storage().data_ptr() != source_audio.untyped_storage().data_ptr()
+
+
+def test_latent_rematerialization_spectral_reset_and_sacrificial_prefix_disruption():
+    target = _av_latent(video_steps=12, height=8, width=8)
+    context = _av_latent(video_steps=7, height=8, width=8)
+    ref_latent = torch.full((1, 24, 1, 8, 8), -2.5, dtype=torch.float32)
+    conditioning = [[torch.tensor([1.0]), {"minimax_refs": [{"kind": "image", "latent": ref_latent}]}]]
+
+    # 1. With reset_denoise=0.0, all 7 video keyframes remain pinned
+    legacy_cond, _ = core.apply_motion_context(
+        conditioning=conditioning,
+        vae=object(),
+        latent=target,
+        context_length="22",
+        audio_context_length=0,
+        context_latent=context,
+        reset_denoise=0.0,
+    )
+    legacy_video_kf = [
+        kf for kf in legacy_cond[0][1]["minimax_keyframes"] if kf.get("latent") is not None
+    ]
+    assert [kf["resolved_frame_index"] for kf in legacy_video_kf] == [0, 1, 5, 9, 13, 17, 18]
+
+    # 2. With reset_denoise=0.30, intermediate sacrificial prefix tokens (t=1..4) are unpinned
+    reset_cond, _ = core.apply_motion_context(
+        conditioning=conditioning,
+        vae=object(),
+        latent=target,
+        context_length="22",
+        audio_context_length=0,
+        context_latent=context,
+        reset_denoise=0.30,
+    )
+    reset_video_kf = [
+        kf for kf in reset_cond[0][1]["minimax_keyframes"] if kf.get("latent") is not None
+    ]
+    assert [kf["resolved_frame_index"] for kf in reset_video_kf] == [0, 17, 18]
+    # Head sacrificial block (t=0) is pulled toward <Picture 1> ref_latent (-2.5)
+    assert float(reset_video_kf[0]["latent"].mean()) < float(legacy_video_kf[0]["latent"].mean())
+
+
+def test_drift_control_two_stage_sigma_release_eliminates_final_step_overwrite():
+    sigmas = torch.tensor([1.0, 0.75, 0.50, 0.25, 0.10, 0.0])
+    video_shape = (1, 24, 12, 8, 8)
+    packed_size = 24 * 12 * 8 * 8 + 32 * 2 * 65
+    packed_mask = torch.ones(1, 1, packed_size)
+
+    state = drift_control_av._DriftControlMaskState(
+        video_shape=video_shape,
+        sigmas=sigmas,
+        prefix_steps=7,
+        seam_floor=0.30,
+    )
+
+    # Stage 1 (sigma=1.0 -> 0.75): seam token (t=6) is anchored near seam_floor (~0.30) to lock pose
+    state.denoise_mask_function(torch.tensor(1.0), packed_mask)
+    seam_high_sigma = float(state.current_video_mask[0, 0, 6, 0, 0])
+    assert 0.28 <= seam_high_sigma <= 0.45
+
+    # Stage 2 (sigma=0.25 -> 0.10): seam token ramps upward to release fine detail
+    state.denoise_mask_function(torch.tensor(0.25), packed_mask)
+    seam_low_sigma = float(state.current_video_mask[0, 0, 6, 0, 0])
+    assert seam_low_sigma > seam_high_sigma + 0.30
+
+    # Final step (sigma=0.10 -> 0.0): full release (1.0) instead of legacy 0.0 overwrite!
+    state.denoise_mask_function(torch.tensor(0.10), packed_mask)
+    assert torch.allclose(
+        state.current_video_mask[:, :, :7],
+        torch.ones_like(state.current_video_mask[:, :, :7]),
+    )
+
+
+def test_hires_anchor_continuity_second_pass_blends_pass1_and_boosts_release_mask(
+    nested_tensor_module,
+):
+    current = _av_latent(video_steps=12, height=8, width=8)
+    previous = _av_latent(video_steps=7, height=8, width=8)
+    previous["anchor_samples"] = torch.full((1, 24, 2, 8, 8), 50.0, dtype=torch.float32)
+
+    output, trim_frames = core.apply_hires_anchor_continuity(
+        current_hires_latent=current,
+        previous_hires_latent=previous,
+        context_length="22",
+        anchor_length="5",
+        reset_denoise=0.30,
+    )
+    video_mask, audio_mask = output["noise_mask"].tensors
+    assert trim_frames == 22
+    # In pass 2 at reset_denoise=0.30, seam tokens (t=5, 6) release above 0.60
+    assert float(video_mask[0, 0, 5, 0, 0]) > 0.60
+    assert float(video_mask[0, 0, 6, 0, 0]) > float(video_mask[0, 0, 5, 0, 0])
+    assert torch.all(audio_mask == 0)

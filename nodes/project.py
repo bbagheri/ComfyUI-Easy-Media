@@ -1870,6 +1870,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         continue_audio=True,
                         freeze_audio=False,
                         reset_denoise=context_reset_denoise,
+                        conditioning=positive,
                     )
                     first_pass_sampling_model = context_swap.out(0)
                     initial_latent = context_swap.out(1)
@@ -2137,6 +2138,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         video_transition_steps=4,
                         video_anchor_only=not audio_only,
                         reset_denoise=context_reset_denoise,
+                        conditioning=second_pass_positive,
                     )
                     upscaled_latent = hires_continuity.out(0)
                     context_trim_frames = hires_continuity.out(1)

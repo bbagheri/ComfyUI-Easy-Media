@@ -957,6 +957,9 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
     ) -> io.NodeOutput:
         if reset_denoise is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
+        extra_kwargs: dict[str, Any] = {}
+        if reset_denoise is not None:
+            extra_kwargs["reset_denoise"] = reset_denoise
         if video_anchor_only:
             output, trim_frames, hard_latent = (
                 apply_reencoded_anchor_motion_context(
@@ -966,7 +969,7 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
                     context_latent=context_latent,
                     context_length=context_length,
                     anchor_length=str(REENCODED_ANCHOR_FRAMES),
-                    reset_denoise=reset_denoise,
+                    **extra_kwargs,
                 )
             )
             return io.NodeOutput(output, trim_frames, hard_latent)
@@ -977,7 +980,7 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
             context_length=context_length,
             audio_context_length=0,
             context_latent=context_latent,
-            reset_denoise=reset_denoise,
+            **extra_kwargs,
         )
         output, trim_frames, hard_latent = build_hard_motion_context(
             conditioning=output,
@@ -1023,8 +1026,8 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                     max=0xFFFFFFFFFFFFFFFF,
                     control_after_generate=io.ControlAfterGenerate.fixed,
                     tooltip=(
-                        "Retained only for graph compatibility with older context_swap "
-                        "patches. Pure Drift-Control ignores this value."
+                        "Deterministic seed for orthogonal Gaussian re-materialization "
+                        "noise when reset_denoise > 0."
                     ),
                 ),
                 io.Boolean.Input(
@@ -1052,6 +1055,7 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Conditioning.Input("conditioning", optional=True),
             ],
             outputs=[
                 io.Model.Output("model"),
@@ -1073,8 +1077,8 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
         continue_audio: bool = True,
         freeze_audio: bool = False,
         reset_denoise: float | None = None,
+        conditioning: Any = None,
     ) -> io.NodeOutput:
-        _ = seed
         if reset_denoise is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
         patched_model, prepared_latent, trim_frames = (
@@ -1087,6 +1091,8 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                 continue_audio=continue_audio,
                 freeze_audio=freeze_audio,
                 reset_denoise=reset_denoise,
+                conditioning=conditioning,
+                seed=int(seed),
             )
         )
         return io.NodeOutput(patched_model, prepared_latent, trim_frames)
@@ -1128,6 +1134,7 @@ class EasyMiniMaxH3HiResContinuity(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Conditioning.Input("conditioning", optional=True),
             ],
             outputs=[
                 io.Latent.Output("latent"),
@@ -1144,16 +1151,22 @@ class EasyMiniMaxH3HiResContinuity(io.ComfyNode):
         video_transition_steps: int = 4,
         video_anchor_only: bool = True,
         reset_denoise: float | None = None,
+        conditioning: Any = None,
     ) -> io.NodeOutput:
         if reset_denoise is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
         if video_anchor_only:
+            extra_kwargs: dict[str, Any] = {}
+            if reset_denoise is not None:
+                extra_kwargs["reset_denoise"] = reset_denoise
+            if conditioning is not None:
+                extra_kwargs["conditioning"] = conditioning
             output, trim_frames = apply_hires_anchor_continuity(
                 current_hires_latent=current_hires_latent,
                 previous_hires_latent=previous_hires_latent,
                 context_length=context_length,
                 anchor_length=str(REENCODED_ANCHOR_FRAMES),
-                reset_denoise=reset_denoise,
+                **extra_kwargs,
             )
             return io.NodeOutput(output, trim_frames)
         output, trim_frames = apply_hires_continuity(

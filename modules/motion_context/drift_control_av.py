@@ -101,6 +101,8 @@ def apply_dynamic_prefix_mask(
     prefix_steps: int,
     taper_steps: int = DRIFT_CONTROL_TAPER_STEPS,
     seam_floor: float = 0.0,
+    current_sigma: float | None = None,
+    sigmas: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the live schedule-matched mask to the copied video prefix."""
     if not torch.is_tensor(packed_mask) or packed_mask.ndim != 3:
@@ -127,11 +129,42 @@ def apply_dynamic_prefix_mask(
 
     output = packed_mask.clone()
     video_mask = output[..., :video_elements].reshape(shape)
-    weights = torch.tensor(
-        temporal_prefix_weights(prefix_steps, taper_steps, seam_floor=seam_floor),
+    floor = max(0.0, min(1.0, float(seam_floor)))
+    clamped_ratio = float(max(0.0, min(1.0, ratio)))
+    base_weights = torch.tensor(
+        temporal_prefix_weights(prefix_steps, taper_steps, seam_floor=floor),
         device=video_mask.device,
         dtype=video_mask.dtype,
-    ).mul_(float(max(0.0, min(1.0, ratio))))
+    )
+    if floor <= 0.0:
+        weights = base_weights.mul(clamped_ratio)
+    else:
+        # Two-Stage "Pose-Lock -> Full-Release" Re-Materialization Schedule:
+        # Stage 1 (high sigma > sigma_release): lock coarse pose at the 2-token seam (~floor)
+        # while releasing sacrificial early prefix tokens to re-materialize from <Picture 1>.
+        # Stage 2 (low sigma <= sigma_release, including final step next_sigma == 0):
+        # ramp denoise_mask smoothly up to 1.0 so KSamplerX0Inpaint synthesizes 100% fresh
+        # facial/anatomical detail instead of blending/overwriting with degraded context.
+        sigma_release = min(0.65, 0.28 + 0.65 * floor)
+        stage1_weights = torch.clamp(base_weights * max(clamped_ratio, 0.80), min=floor, max=1.0)
+        if current_sigma is not None and math.isfinite(float(current_sigma)):
+            curr_s = float(current_sigma)
+            next_s = (
+                next_schedule_sigma(curr_s, sigmas)
+                if sigmas is not None
+                else curr_s * clamped_ratio
+            )
+            if next_s <= 0.0 or curr_s <= 0.0:
+                release_progress = 1.0
+            elif curr_s <= sigma_release:
+                release_progress = (1.0 - min(1.0, next_s / max(1e-6, sigma_release))) ** 0.75
+            elif next_s < sigma_release:
+                release_progress = 0.35 * (1.0 - next_s / max(1e-6, sigma_release))
+            else:
+                release_progress = 0.0
+        else:
+            release_progress = 1.0 if clamped_ratio <= 0.0 else 0.0
+        weights = stage1_weights + (1.0 - stage1_weights) * float(release_progress)
     video_mask[:, :, :prefix_steps] = weights.view(
         1, 1, prefix_steps, 1, 1
     )
@@ -177,6 +210,8 @@ def prepare_context_swap_latent(
     freeze_audio: bool,
     audio_release_steps: int = DRIFT_CONTROL_AUDIO_RELEASE_STEPS,
     reset_denoise: float | None = None,
+    conditioning: Any = None,
+    seed: int = 0,
 ) -> tuple[dict[str, Any], int, int]:
     """Copy a clean predecessor prefix without modifying the predecessor latent.
 
@@ -217,8 +252,14 @@ def prepare_context_swap_latent(
         int(context_frames),
     )
     r = _resolve_context_reset_denoise(reset_denoise)
-    if r > 0.0 and int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8:
-        blocks = _reset_context_blocks_to_ref(blocks, reset_denoise=r)
+    has_spatial_room = int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8
+    if r > 0.0 and has_spatial_room:
+        blocks = _reset_context_blocks_to_ref(
+            blocks,
+            conditioning=conditioning,
+            reset_denoise=r,
+            seed=int(seed),
+        )
     copied_video = torch.cat(blocks, dim=2)
     video_steps = int(copied_video.shape[2])
     if covered != int(context_frames):
@@ -247,7 +288,20 @@ def prepare_context_swap_latent(
         dtype=output_video.dtype,
     )
     video_mask = torch.ones_like(output_video[:, :1], dtype=torch.float32)
-    video_mask[:, :, :video_steps] = 0.0
+    if r > 0.0 and has_spatial_room:
+        init_weights = torch.tensor(
+            temporal_prefix_weights(
+                video_steps,
+                min(DRIFT_CONTROL_TAPER_STEPS, video_steps),
+                seam_floor=r,
+            ),
+            device=video_mask.device,
+            dtype=video_mask.dtype,
+        )
+        init_weights = torch.ceil(init_weights * 256.0) / 256.0
+        video_mask[:, :, :video_steps] = init_weights.view(1, 1, video_steps, 1, 1)
+    else:
+        video_mask[:, :, :video_steps] = 0.0
     video_mask = _merge_noise_mask(
         video_mask,
         existing_video_mask,
@@ -341,6 +395,8 @@ class _DriftControlMaskState:
             prefix_steps=self.prefix_steps,
             taper_steps=min(DRIFT_CONTROL_TAPER_STEPS, self.prefix_steps),
             seam_floor=self.seam_floor,
+            current_sigma=current,
+            sigmas=schedule,
         )
         self.current_video_mask = video_mask
         return output
@@ -441,6 +497,8 @@ def apply_context_swap_drift_control(
     continue_audio: bool = True,
     freeze_audio: bool = False,
     reset_denoise: float | None = None,
+    conditioning: Any = None,
+    seed: int = 0,
 ) -> tuple[Any, dict[str, Any], int]:
     """Prepare the disposable AV prefix and return a Drift-Control patched model."""
     prepared, trim_frames, video_steps = prepare_context_swap_latent(
@@ -450,6 +508,8 @@ def apply_context_swap_drift_control(
         continue_audio=bool(continue_audio),
         freeze_audio=bool(freeze_audio),
         reset_denoise=reset_denoise,
+        conditioning=conditioning,
+        seed=int(seed),
     )
     patched_model = install_drift_control_av_model(
         model,
