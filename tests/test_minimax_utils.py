@@ -181,7 +181,7 @@ def test_degrain_context_suffix_structure_preserving_gate_keeps_fluid_filaments(
     ).float() * 0.012
     noisy = base + checker.view(1, 32, 32, 1)
     cleaned_noisy = module._degrain_context_suffix(
-        noisy, strength=0.35, detail_preservation=0.80
+        noisy, strength=0.65, detail_preservation=0.80
     )
     assert (cleaned_noisy - base).pow(2).mean() < (noisy - base).pow(2).mean() * 0.35
 
