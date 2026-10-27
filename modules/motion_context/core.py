@@ -339,52 +339,64 @@ def _sanitize_context_video_latent(
     preserve = _resolve_context_detail_preservation(detail_preservation)
 
     orig_dtype = video.dtype
-    x = video.float()
-    b, c, t, h, w = x.shape
-    if preserve > 0.0:
-        gate_bt = _compute_latent_detail_gate(x)
-        gate_5d = gate_bt.reshape(b, t, 1, h, w).permute(0, 2, 1, 3, 4)
-    else:
-        gate_bt = None
-        gate_5d = None
-
-    # 1. Per-channel soft-knee outlier clamp to stop variance spikes (relaxed on coherent fluid/specular glints)
-    mean = x.mean(dim=(2, 3, 4), keepdim=True)
-    std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
-    z = (x - mean) / std
-    base_knee = max(2.8, 3.8 - 0.5 * max(0.0, scale - 0.65))
-    knee = base_knee + (1.8 * preserve) * gate_5d if gate_5d is not None else base_knee
-    excess = (z.abs() - knee).clamp(min=0.0)
-    z_clamped = z.sign() * (
-        torch.minimum(z.abs(), torch.as_tensor(knee, device=z.device, dtype=z.dtype))
-        + torch.tanh(excess * 0.5) * 1.8
+    orig_device = video.device
+    exec_device = (
+        torch.device("cuda")
+        if (orig_device.type == "cpu" and torch.cuda.is_available())
+        else orig_device
     )
-    x = mean + z_clamped * std
+    with torch.no_grad():
+        x = video.to(device=exec_device, dtype=torch.float32, non_blocking=True)
+        b, c, t, h, w = x.shape
+        if preserve > 0.0:
+            gate_bt = _compute_latent_detail_gate(x)
+            gate_5d = gate_bt.reshape(b, t, 1, h, w).permute(0, 2, 1, 3, 4)
+        else:
+            gate_bt = None
+            gate_5d = None
 
-    # 2. Global std inflation anchor (prevents 0.97 -> 1.12 std creep across 10+ segments)
-    global_std = x.std().clamp(min=1e-5)
-    target_std = 0.985
-    if global_std > target_std:
-        std_pull = min(0.85, 0.45 * (scale / 0.65))
-        anchored_std = target_std + (global_std - target_std) * (1.0 - std_pull)
-        x = mean + (x - mean) * (anchored_std / global_std)
+        # 1. Per-channel soft-knee outlier clamp to stop variance spikes (relaxed on coherent fluid/specular glints)
+        mean = x.mean(dim=(2, 3, 4), keepdim=True)
         std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+        z = (x - mean) / std
+        base_knee = max(2.8, 3.8 - 0.5 * max(0.0, scale - 0.65))
+        knee = base_knee + (1.8 * preserve) * gate_5d if gate_5d is not None else base_knee
+        excess = (z.abs() - knee).clamp(min=0.0)
+        z_clamped = z.sign() * (
+            torch.minimum(z.abs(), torch.as_tensor(knee, device=z.device, dtype=z.dtype))
+            + torch.tanh(excess * 0.5) * 1.8
+        )
+        x = mean + z_clamped * std
 
-    # 3. Edge- and flow-preserving spatial high-frequency damping across (H_lat, W_lat)
-    alpha_lat = min(0.75, 0.25 * (scale / 0.65))
-    flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-    kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
-    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
-    padded = F.pad(flat, (1, 1, 1, 1), mode="reflect")
-    blurred = F.conv2d(padded, kernel_2d, groups=c)
-    delta = flat - blurred
-    tau_factor = 0.35 * max(0.85, scale / 0.65)
-    tau_sq = (tau_factor * std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)).square()
-    weight = torch.exp(-delta.square() / (2.0 * tau_sq))
-    if gate_bt is not None:
-        weight = weight * (1.0 - (0.92 * preserve * gate_bt).clamp(0.0, 0.95))
-    cleaned = flat - (alpha_lat * weight) * delta
-    return cleaned.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4).to(dtype=orig_dtype).contiguous()
+        # 2. Global std inflation anchor (prevents 0.97 -> 1.12 std creep across 10+ segments)
+        global_std = x.std().clamp(min=1e-5)
+        target_std = 0.985
+        if global_std > target_std:
+            std_pull = min(0.85, 0.45 * (scale / 0.65))
+            anchored_std = target_std + (global_std - target_std) * (1.0 - std_pull)
+            x = mean + (x - mean) * (anchored_std / global_std)
+            std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+
+        # 3. Edge- and flow-preserving spatial high-frequency damping across (H_lat, W_lat)
+        alpha_lat = min(0.75, 0.25 * (scale / 0.65))
+        flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
+        kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
+        padded = F.pad(flat, (1, 1, 1, 1), mode="reflect")
+        blurred = F.conv2d(padded, kernel_2d, groups=c)
+        delta = flat - blurred
+        tau_factor = 0.35 * max(0.85, scale / 0.65)
+        tau_sq = (tau_factor * std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)).square()
+        weight = torch.exp(-delta.square() / (2.0 * tau_sq))
+        if gate_bt is not None:
+            weight = weight * (1.0 - (0.92 * preserve * gate_bt).clamp(0.0, 0.95))
+        cleaned = flat - (alpha_lat * weight) * delta
+        return (
+            cleaned.reshape(b, t, c, h, w)
+            .permute(0, 2, 1, 3, 4)
+            .to(device=orig_device, dtype=orig_dtype)
+            .contiguous()
+        )
 
 
 def trim_motion_context_latent(
@@ -817,154 +829,161 @@ def _reset_context_blocks_to_ref(
 
     preserve = _resolve_context_detail_preservation(detail_preservation)
     orig_dtype = first.dtype
-    cat = torch.cat(blocks, dim=2).float()
-    b, c, t, h, w = cat.shape
-    ctx_mean = cat.mean(dim=(2, 3, 4), keepdim=True)
-    ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
-
-    # 1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs (or std creep anchor)
-    # Taper the moment shift on the terminal boundary token (t-1, frames 18..21 immediately preceding
-    # delivered frame 22) so the re-materialization color/luminance pull happens inside the discarded
-    # prefix without introducing a brightness or color step right at the segment splice.
-    ref_stats = _extract_ref_video_stats(conditioning)
-    if ref_stats is not None:
-        ref_mean, ref_std = ref_stats
-        ref_mean = ref_mean.to(device=cat.device, dtype=torch.float32)
-        ref_std = ref_std.to(device=cat.device, dtype=torch.float32)
-        std_blend = min(0.85, r * 1.4)
-        mean_blend = min(0.35, r * 0.5)
-        mean_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
-        std_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
-        if t >= 2:
-            mean_t[:, :, -1] = 0.15
-            std_t[:, :, -1] = 0.50
-        if t >= 3:
-            mean_t[:, :, -2] = 0.70
-            std_t[:, :, -2] = 0.80
-        target_std = ctx_std + (std_blend * std_t) * (ref_std - ctx_std)
-        target_mean = ctx_mean + (mean_blend * mean_t) * (ref_mean - ctx_mean)
-        cat = target_mean + (cat - ctx_mean) * (target_std / ctx_std)
-        ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
-    else:
-        global_std = float(cat.std().item())
-        if global_std > 0.985:
-            pull = min(0.75, r * 1.15)
-            anchored_std = 0.985 + (global_std - 0.985) * (1.0 - pull)
-            cat = ctx_mean + (cat - ctx_mean) * (anchored_std / max(1e-5, global_std))
-            ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
-
-    # 2. 3-band spectral decomposition: z_low (coarse pose >= 64px) + z_mid (2..4 cell warping) + z_high (grain)
-    flat = cat.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-    k1 = torch.tensor([0.25, 0.5, 0.25], device=cat.device, dtype=torch.float32)
-    k2 = torch.outer(k1, k1).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
-    fine_low = F.conv2d(F.pad(flat, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
-
-    pool_h = max(2, h // 4)
-    pool_w = max(2, w // 4)
-    coarse_pooled = F.adaptive_avg_pool2d(fine_low, (pool_h, pool_w))
-    coarse_up = F.interpolate(coarse_pooled, size=(h, w), mode="bilinear", align_corners=False)
-    z_low = F.conv2d(F.pad(coarse_up, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
-    z_mid = fine_low - z_low
-    z_high = flat - fine_low
-
-    # 3. Position-aware damping:
-    # - Sacrificial prefix tokens (0 .. t-3, frames 0..16): strong mid+high wipe + orthogonal noise
-    # - Bridge token (t-2, frame 17): intermediate spectral + orthogonal transition
-    # - Terminal seam token (t-1, frames 18..21 immediately before delivered frame 22): preserve
-    #   mid-frequency pose/structure (0.15 * d_mid_seam) and suppress random perturbation (0.12 * eta_seam)
-    #   while still scrubbing 1-cell grain (0.65 * d_high_seam), preventing any jump at the splice.
-    d_high_seam = min(0.95, 1.6 * r)
-    d_mid_seam = min(0.80, 1.25 * r)
-    eta_seam = min(0.68, 0.90 * r)
-    d_high_vec = torch.full((t,), d_high_seam, device=cat.device, dtype=torch.float32)
-    d_mid_vec = torch.full((t,), d_mid_seam, device=cat.device, dtype=torch.float32)
-    eta_vec = torch.full((t,), eta_seam, device=cat.device, dtype=torch.float32)
-    if t > 2:
-        sac_count = t - 2
-        for idx in range(sac_count):
-            sac_progress = 1.0 - (float(idx) / float(max(1, sac_count)))
-            d_high_vec[idx] = min(0.98, d_high_seam + 0.30 * sac_progress)
-            d_mid_vec[idx] = min(0.92, d_mid_seam + 0.30 * sac_progress)
-            eta_vec[idx] = min(0.88, eta_seam + 0.25 * sac_progress)
-    if t >= 2:
-        d_high_vec[t - 2] = d_high_seam
-        d_mid_vec[t - 2] = 0.85 * d_mid_seam
-        eta_vec[t - 2] = 0.75 * eta_seam
-        d_high_vec[t - 1] = 0.65 * d_high_seam
-        d_mid_vec[t - 1] = 0.15 * d_mid_seam
-        eta_vec[t - 1] = 0.12 * eta_seam
-
-    d_high_bt = d_high_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
-    d_mid_bt = d_mid_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
-    eta_bt = eta_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
-
-    preserve_mask_bt: torch.Tensor | None = None
-    if preserve > 0.0:
-        gate_bt = _compute_latent_detail_gate(cat)
-        gamma_vec = torch.full((t,), 0.45, device=cat.device, dtype=torch.float32)
-        if t >= 1:
-            gamma_vec[t - 1] = 0.95
-        if t >= 2:
-            gamma_vec[t - 2] = 0.90
-        if t >= 3:
-            gamma_vec[t - 3] = 0.80
-        if t >= 4:
-            gamma_vec[t - 4] = 0.68
-        gamma_bt = gamma_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
-        preserve_mask_bt = (preserve * gamma_bt * gate_bt).clamp(0.0, 0.92)
-        d_high_bt = d_high_bt * (1.0 - preserve_mask_bt)
-        d_mid_bt = d_mid_bt * (1.0 - 0.90 * preserve_mask_bt)
-        eta_bt = eta_bt * (1.0 - preserve_mask_bt)
-
-    removed = d_mid_bt * z_mid + d_high_bt * z_high
-    retained = z_low + (1.0 - d_mid_bt) * z_mid + (1.0 - d_high_bt) * z_high
-
-    # 4. Deterministic orthogonal Gaussian noise injection in the mid+high band
-    gen = torch.Generator(device="cpu").manual_seed((int(seed) + 0x5A179B) & 0xFFFFFFFFFFFFFFFF)
-    raw_noise = torch.randn((b * t, c, h, w), generator=gen, dtype=torch.float32).to(device=cat.device)
-    noise_coarse = F.interpolate(
-        F.adaptive_avg_pool2d(raw_noise, (pool_h, pool_w)),
-        size=(h, w),
-        mode="bilinear",
-        align_corners=False,
+    orig_device = first.device
+    exec_device = (
+        torch.device("cuda")
+        if (orig_device.type == "cpu" and torch.cuda.is_available())
+        else orig_device
     )
-    noise_mh = raw_noise - noise_coarse
-    signal_mh = flat - z_low
-    sig_norm_sq = (signal_mh * signal_mh).sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
-    proj = (noise_mh * signal_mh).sum(dim=(2, 3), keepdim=True) / sig_norm_sq
-    eps_perp = noise_mh - proj * signal_mh
-    eps_std = eps_perp.std(dim=(2, 3), keepdim=True).clamp(min=1e-5)
-    removed_std = removed.std(dim=(2, 3), keepdim=True)
-    cleaned_flat = retained + eta_bt * removed_std * (eps_perp / eps_std)
-    cleaned = cleaned_flat.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    with torch.no_grad():
+        cat = torch.cat(blocks, dim=2).to(device=exec_device, dtype=torch.float32, non_blocking=True)
+        b, c, t, h, w = cat.shape
+        ctx_mean = cat.mean(dim=(2, 3, 4), keepdim=True)
+        ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
 
-    # 5. Seed <Picture 1> reference distribution into earliest sacrificial prefix blocks (t=0..1)
-    if t >= 5:
-        ref_lat = _extract_first_ref_latent(
-            conditioning,
-            target_height=h,
-            target_width=w,
-            device=cat.device,
-            dtype=torch.float32,
+        # 1. AdaIN per-channel moment anchor toward clean <Picture N> minimax_refs (or std creep anchor)
+        # Taper the moment shift on the terminal boundary token (t-1, frames 18..21 immediately preceding
+        # delivered frame 22) so the re-materialization color/luminance pull happens inside the discarded
+        # prefix without introducing a brightness or color step right at the segment splice.
+        ref_stats = _extract_ref_video_stats(conditioning)
+        if ref_stats is not None:
+            ref_mean, ref_std = ref_stats
+            ref_mean = ref_mean.to(device=cat.device, dtype=torch.float32)
+            ref_std = ref_std.to(device=cat.device, dtype=torch.float32)
+            std_blend = min(0.85, r * 1.4)
+            mean_blend = min(0.35, r * 0.5)
+            mean_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
+            std_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
+            if t >= 2:
+                mean_t[:, :, -1] = 0.15
+                std_t[:, :, -1] = 0.50
+            if t >= 3:
+                mean_t[:, :, -2] = 0.70
+                std_t[:, :, -2] = 0.80
+            target_std = ctx_std + (std_blend * std_t) * (ref_std - ctx_std)
+            target_mean = ctx_mean + (mean_blend * mean_t) * (ref_mean - ctx_mean)
+            cat = target_mean + (cat - ctx_mean) * (target_std / ctx_std)
+            ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+        else:
+            global_std = float(cat.std().item())
+            if global_std > 0.985:
+                pull = min(0.75, r * 1.15)
+                anchored_std = 0.985 + (global_std - 0.985) * (1.0 - pull)
+                cat = ctx_mean + (cat - ctx_mean) * (anchored_std / max(1e-5, global_std))
+                ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+
+        # 2. 3-band spectral decomposition: z_low (coarse pose >= 64px) + z_mid (2..4 cell warping) + z_high (grain)
+        flat = cat.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        k1 = torch.tensor([0.25, 0.5, 0.25], device=cat.device, dtype=torch.float32)
+        k2 = torch.outer(k1, k1).view(1, 1, 3, 3).expand(c, 1, 3, 3).contiguous()
+        fine_low = F.conv2d(F.pad(flat, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
+
+        pool_h = max(2, h // 4)
+        pool_w = max(2, w // 4)
+        coarse_pooled = F.adaptive_avg_pool2d(fine_low, (pool_h, pool_w))
+        coarse_up = F.interpolate(coarse_pooled, size=(h, w), mode="bilinear", align_corners=False)
+        z_low = F.conv2d(F.pad(coarse_up, (1, 1, 1, 1), mode="reflect"), k2, groups=c)
+        z_mid = fine_low - z_low
+        z_high = flat - fine_low
+
+        # 3. Position-aware damping:
+        # - Sacrificial prefix tokens (0 .. t-3, frames 0..16): strong mid+high wipe + orthogonal noise
+        # - Bridge token (t-2, frame 17): intermediate spectral + orthogonal transition
+        # - Terminal seam token (t-1, frames 18..21 immediately before delivered frame 22): preserve
+        #   mid-frequency pose/structure (0.15 * d_mid_seam) and suppress random perturbation (0.12 * eta_seam)
+        #   while still scrubbing 1-cell grain (0.65 * d_high_seam), preventing any jump at the splice.
+        d_high_seam = min(0.95, 1.6 * r)
+        d_mid_seam = min(0.80, 1.25 * r)
+        eta_seam = min(0.68, 0.90 * r)
+        d_high_vec = torch.full((t,), d_high_seam, device=cat.device, dtype=torch.float32)
+        d_mid_vec = torch.full((t,), d_mid_seam, device=cat.device, dtype=torch.float32)
+        eta_vec = torch.full((t,), eta_seam, device=cat.device, dtype=torch.float32)
+        if t > 2:
+            sac_count = t - 2
+            for idx in range(sac_count):
+                sac_progress = 1.0 - (float(idx) / float(max(1, sac_count)))
+                d_high_vec[idx] = min(0.98, d_high_seam + 0.30 * sac_progress)
+                d_mid_vec[idx] = min(0.92, d_mid_seam + 0.30 * sac_progress)
+                eta_vec[idx] = min(0.88, eta_seam + 0.25 * sac_progress)
+        if t >= 2:
+            d_high_vec[t - 2] = d_high_seam
+            d_mid_vec[t - 2] = 0.85 * d_mid_seam
+            eta_vec[t - 2] = 0.75 * eta_seam
+            d_high_vec[t - 1] = 0.65 * d_high_seam
+            d_mid_vec[t - 1] = 0.15 * d_mid_seam
+            eta_vec[t - 1] = 0.12 * eta_seam
+
+        d_high_bt = d_high_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+        d_mid_bt = d_mid_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+        eta_bt = eta_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+
+        preserve_mask_bt: torch.Tensor | None = None
+        if preserve > 0.0:
+            gate_bt = _compute_latent_detail_gate(cat)
+            gamma_vec = torch.full((t,), 0.45, device=cat.device, dtype=torch.float32)
+            if t >= 1:
+                gamma_vec[t - 1] = 0.95
+            if t >= 2:
+                gamma_vec[t - 2] = 0.90
+            if t >= 3:
+                gamma_vec[t - 3] = 0.80
+            if t >= 4:
+                gamma_vec[t - 4] = 0.68
+            gamma_bt = gamma_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+            preserve_mask_bt = (preserve * gamma_bt * gate_bt).clamp(0.0, 0.92)
+            d_high_bt = d_high_bt * (1.0 - preserve_mask_bt)
+            d_mid_bt = d_mid_bt * (1.0 - 0.90 * preserve_mask_bt)
+            eta_bt = eta_bt * (1.0 - preserve_mask_bt)
+
+        removed = d_mid_bt * z_mid + d_high_bt * z_high
+        retained = z_low + (1.0 - d_mid_bt) * z_mid + (1.0 - d_high_bt) * z_high
+
+        # 4. Deterministic orthogonal Gaussian noise injection in the mid+high band
+        gen = torch.Generator(device="cpu").manual_seed((int(seed) + 0x5A179B) & 0xFFFFFFFFFFFFFFFF)
+        raw_noise = torch.randn((b * t, c, h, w), generator=gen, dtype=torch.float32).to(device=cat.device)
+        noise_coarse = F.interpolate(
+            F.adaptive_avg_pool2d(raw_noise, (pool_h, pool_w)),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
         )
-        if ref_lat is not None:
-            preserve_5d = (
-                preserve_mask_bt.reshape(b, t, 1, h, w).permute(0, 2, 1, 3, 4)
-                if preserve_mask_bt is not None
-                else None
-            )
-            for idx in range(min(2, t - 3)):
-                w_seed_val = min(0.65, 1.25 * r) * (1.0 - 0.45 * float(idx))
-                if preserve_5d is not None:
-                    w_seed = w_seed_val * (1.0 - 0.75 * preserve_5d[:, :, idx : idx + 1])
-                else:
-                    w_seed = w_seed_val
-                cleaned[:, :, idx : idx + 1] = (
-                    (1.0 - w_seed) * cleaned[:, :, idx : idx + 1] + w_seed * ref_lat
-                )
+        noise_mh = raw_noise - noise_coarse
+        signal_mh = flat - z_low
+        sig_norm_sq = (signal_mh * signal_mh).sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        proj = (noise_mh * signal_mh).sum(dim=(2, 3), keepdim=True) / sig_norm_sq
+        eps_perp = noise_mh - proj * signal_mh
+        eps_std = eps_perp.std(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+        removed_std = removed.std(dim=(2, 3), keepdim=True)
+        cleaned_flat = retained + eta_bt * removed_std * (eps_perp / eps_std)
+        cleaned = cleaned_flat.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
 
-    cleaned = cleaned.to(dtype=orig_dtype).contiguous()
-    return [cleaned[:, :, idx : idx + 1].clone() for idx in range(t)]
+        # 5. Seed <Picture 1> reference distribution into earliest sacrificial prefix blocks (t=0..1)
+        if t >= 5:
+            ref_lat = _extract_first_ref_latent(
+                conditioning,
+                target_height=h,
+                target_width=w,
+                device=cat.device,
+                dtype=torch.float32,
+            )
+            if ref_lat is not None:
+                preserve_5d = (
+                    preserve_mask_bt.reshape(b, t, 1, h, w).permute(0, 2, 1, 3, 4)
+                    if preserve_mask_bt is not None
+                    else None
+                )
+                for idx in range(min(2, t - 3)):
+                    w_seed_val = min(0.65, 1.25 * r) * (1.0 - 0.45 * float(idx))
+                    if preserve_5d is not None:
+                        w_seed = w_seed_val * (1.0 - 0.75 * preserve_5d[:, :, idx : idx + 1])
+                    else:
+                        w_seed = w_seed_val
+                    cleaned[:, :, idx : idx + 1] = (
+                        (1.0 - w_seed) * cleaned[:, :, idx : idx + 1] + w_seed * ref_lat
+                    )
+
+        cleaned = cleaned.to(device=orig_device, dtype=orig_dtype).contiguous()
+        return [cleaned[:, :, idx : idx + 1].clone() for idx in range(t)]
 
 
 def _reencoded_anchor_av_latent(

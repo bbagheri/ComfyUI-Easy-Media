@@ -121,46 +121,61 @@ def _degrain_context_suffix(
         return images
 
     orig_dtype = images.dtype
-    # [T, H, W, C] -> [T, C, H, W]
-    x = images.permute(0, 3, 1, 2).float()
-    channels = int(x.shape[1])
-    rgb_channels = min(3, channels)
-    kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
-    kernel_2d = (
-        torch.outer(kernel_1d, kernel_1d)
-        .view(1, 1, 3, 3)
-        .expand(channels, 1, 3, 3)
-        .contiguous()
+    orig_device = images.device
+    exec_device = (
+        torch.device("cuda")
+        if (orig_device.type == "cpu" and torch.cuda.is_available())
+        else orig_device
     )
+    with torch.no_grad():
+        # [T, H, W, C] -> [T, C, H, W] on GPU when available (~8s CPU -> <0.05s CUDA)
+        x = (
+            images.to(device=exec_device, dtype=torch.float32, non_blocking=True)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        channels = int(x.shape[1])
+        rgb_channels = min(3, channels)
+        kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=exec_device, dtype=torch.float32)
+        kernel_2d = (
+            torch.outer(kernel_1d, kernel_1d)
+            .view(1, 1, 3, 3)
+            .expand(channels, 1, 3, 3)
+            .contiguous()
+        )
 
-    tau_1 = base_tau * max(0.85, scale / H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH)
-    if preserve > 0.0:
-        detail_gate = _compute_pixel_detail_gate(x, rgb_channels, tau_1)
-        preserve_factor = 1.0 - (preserve * 0.92 * detail_gate).clamp(0.0, 0.95)
-    else:
-        preserve_factor = 1.0
+        tau_1 = base_tau * max(0.85, scale / H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH)
+        if preserve > 0.0:
+            detail_gate = _compute_pixel_detail_gate(x, rgb_channels, tau_1)
+            preserve_factor = 1.0 - (preserve * 0.92 * detail_gate).clamp(0.0, 0.95)
+        else:
+            preserve_factor = 1.0
 
-    # Pass 1: 3x3 fine-grain bilateral filter (1px solver noise)
-    alpha_1 = min(0.95, scale)
-    padded_1 = F.pad(x, (1, 1, 1, 1), mode="reflect")
-    blurred_1 = F.conv2d(padded_1, kernel_2d, groups=channels)
-    delta_1 = x - blurred_1
-    diff_sq_1 = delta_1[:, :rgb_channels].square().mean(dim=1, keepdim=True)
-    weight_1 = torch.exp(-diff_sq_1 / (2.0 * tau_1 * tau_1)) * preserve_factor
-    cleaned = x - (alpha_1 * weight_1) * delta_1
+        # Pass 1: 3x3 fine-grain bilateral filter (1px solver noise)
+        alpha_1 = min(0.95, scale)
+        padded_1 = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        blurred_1 = F.conv2d(padded_1, kernel_2d, groups=channels)
+        delta_1 = x - blurred_1
+        diff_sq_1 = delta_1[:, :rgb_channels].square().mean(dim=1, keepdim=True)
+        weight_1 = torch.exp(-diff_sq_1 / (2.0 * tau_1 * tau_1)) * preserve_factor
+        cleaned = x - (alpha_1 * weight_1) * delta_1
 
-    # Pass 2: 5x5 dilated bilateral filter (2-3px clumped mid-frequency stippling in 10+ segment runs)
-    if scale > 0.70 and int(images.shape[1]) >= 16 and int(images.shape[2]) >= 16:
-        alpha_2 = min(0.85, (scale - 0.65) * 0.85)
-        tau_2 = tau_1 * 1.15
-        padded_2 = F.pad(cleaned, (2, 2, 2, 2), mode="reflect")
-        blurred_2 = F.conv2d(padded_2, kernel_2d, groups=channels, dilation=2)
-        delta_2 = cleaned - blurred_2
-        diff_sq_2 = delta_2[:, :rgb_channels].square().mean(dim=1, keepdim=True)
-        weight_2 = torch.exp(-diff_sq_2 / (2.0 * tau_2 * tau_2)) * preserve_factor
-        cleaned = cleaned - (alpha_2 * weight_2) * delta_2
+        # Pass 2: 5x5 dilated bilateral filter (2-3px clumped mid-frequency stippling in 10+ segment runs)
+        if scale > 0.70 and int(images.shape[1]) >= 16 and int(images.shape[2]) >= 16:
+            alpha_2 = min(0.85, (scale - 0.65) * 0.85)
+            tau_2 = tau_1 * 0.15 + tau_1
+            padded_2 = F.pad(cleaned, (2, 2, 2, 2), mode="reflect")
+            blurred_2 = F.conv2d(padded_2, kernel_2d, groups=channels, dilation=2)
+            delta_2 = cleaned - blurred_2
+            diff_sq_2 = delta_2[:, :rgb_channels].square().mean(dim=1, keepdim=True)
+            weight_2 = torch.exp(-diff_sq_2 / (2.0 * tau_2 * tau_2)) * preserve_factor
+            cleaned = cleaned - (alpha_2 * weight_2) * delta_2
 
-    return cleaned.permute(0, 2, 3, 1).to(dtype=orig_dtype).contiguous()
+        return (
+            cleaned.permute(0, 2, 3, 1)
+            .to(device=orig_device, dtype=orig_dtype)
+            .contiguous()
+        )
 
 
 def selflift_transition_step(step_count: int, ratio: float) -> int:
