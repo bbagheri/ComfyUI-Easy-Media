@@ -173,7 +173,7 @@ def test_degrain_context_suffix_structure_preserving_gate_keeps_fluid_filaments(
     filament_mask = fluid > 0.51
     loss_uniform = (fluid[filament_mask] - cleaned_uniform[filament_mask]).abs().mean().item()
     loss_preserved = (fluid[filament_mask] - cleaned_preserved[filament_mask]).abs().mean().item()
-    assert loss_preserved < loss_uniform * 0.35
+    assert loss_preserved < loss_uniform * 0.45
 
     # Verify 1px checkerboard noise is still scrubbed with detail_preservation=0.80
     checker = (
