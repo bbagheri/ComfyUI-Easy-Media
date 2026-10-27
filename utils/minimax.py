@@ -16,19 +16,63 @@ H3_VAE_FINAL_TOKEN_DROP = 3
 H3_FRAMES_PER_TOKEN = (1, 4, 4, 4, 4)
 H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH = 0.65
 H3_DEFAULT_CONTEXT_DEGRAIN_THRESHOLD = 0.025
+H3_DEFAULT_CONTEXT_DETAIL_PRESERVATION = 0.50
+
+
+def _compute_pixel_detail_gate(
+    x: torch.Tensor,
+    rgb_channels: int,
+    tau_ref: float,
+) -> torch.Tensor:
+    """Compute a [T, 1, H, W] structure-and-flow gate in [0, 1] for pixel context frames.
+
+    Distinguishes coherent physical high-frequency details (anisotropic fluid streams,
+    splashes, rivulets, moving droplets) from isotropic 1-2px digital solver grain:
+    1. Centered 2-step gradients (gx, gy) vanish on 1px alternating checkerboard (+ - +)
+       while responding strongly to real filaments and droplets.
+    2. Structure tensor anisotropy A = ((Jxx - Jyy)^2 + 4*Jxy^2) / (Jxx + Jyy + eps)^2
+       identifies directional fluid filaments and edges even at low translucent contrast.
+    3. Temporal flow innovation |I(t) - I(t-1)| co-located with spatial structure
+       captures moving fluid and droplets across adjacent frames.
+    """
+    rgb = x[:, :rgb_channels]
+    pad = F.pad(rgb, (1, 1, 1, 1), mode="reflect")
+    gx = 0.5 * (pad[:, :, 1:-1, 2:] - pad[:, :, 1:-1, :-2])
+    gy = 0.5 * (pad[:, :, 2:, 1:-1] - pad[:, :, :-2, 1:-1])
+
+    j_xx = F.avg_pool2d(gx.square().mean(dim=1, keepdim=True), kernel_size=3, stride=1, padding=1)
+    j_yy = F.avg_pool2d(gy.square().mean(dim=1, keepdim=True), kernel_size=3, stride=1, padding=1)
+    j_xy = F.avg_pool2d((gx * gy).mean(dim=1, keepdim=True), kernel_size=3, stride=1, padding=1)
+
+    trace = j_xx + j_yy
+    anisotropy = ((j_xx - j_yy).square() + 4.0 * j_xy.square()) / (trace.square() + 1e-8)
+    grad_mag = trace.clamp(min=0.0).sqrt()
+    salience = (grad_mag / max(1e-5, tau_ref * 0.45)).clamp(0.0, 1.5)
+    aniso_score = (anisotropy * salience).clamp(0.0, 1.0)
+
+    if int(rgb.shape[0]) >= 2:
+        dt = (rgb[1:] - rgb[:-1]).square().mean(dim=1, keepdim=True).sqrt()
+        dt = torch.cat([dt[:1], dt], dim=0)
+        dt_smooth = F.avg_pool2d(dt, kernel_size=3, stride=1, padding=1)
+        flow_score = (
+            (dt_smooth / max(1e-5, tau_ref * 0.70)) * salience.clamp(0.0, 1.0)
+        ).clamp(0.0, 1.0)
+        return torch.maximum(aniso_score, 0.85 * flow_score).clamp(0.0, 1.0)
+    return aniso_score
 
 
 def _degrain_context_suffix(
     images: torch.Tensor,
     strength: float | None = None,
     threshold: float | None = None,
+    detail_preservation: float | None = None,
 ) -> torch.Tensor:
-    """Apply an edge-preserving bilateral micro-denoiser to context handoff frames.
+    """Apply an edge- and flow-preserving bilateral micro-denoiser to context handoff frames.
 
     Damps low-amplitude 1-2px digital solver grain (|delta| < threshold) before
     VAEEncode builds the next segment's prefix latent, while leaving structural
     edges (eyes, lips, hair strands, clothing seams where |delta| >> threshold)
-    100% sharp.
+    and anisotropic/moving fluid flow details (gated by detail_preservation) sharp.
     """
     if (
         not isinstance(images, torch.Tensor)
@@ -59,9 +103,20 @@ def _degrain_context_suffix(
             )
         except (TypeError, ValueError):
             threshold = H3_DEFAULT_CONTEXT_DEGRAIN_THRESHOLD
+    if detail_preservation is None:
+        try:
+            detail_preservation = float(
+                os.environ.get(
+                    "EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION",
+                    "0.0",
+                )
+            )
+        except (TypeError, ValueError):
+            detail_preservation = 0.0
 
     scale = max(0.0, min(2.0, float(strength)))
     base_tau = float(threshold)
+    preserve = max(0.0, min(1.0, float(detail_preservation)))
     if scale <= 0.0 or base_tau <= 0.0:
         return images
 
@@ -78,14 +133,20 @@ def _degrain_context_suffix(
         .contiguous()
     )
 
+    tau_1 = base_tau * max(0.85, scale / H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH)
+    if preserve > 0.0:
+        detail_gate = _compute_pixel_detail_gate(x, rgb_channels, tau_1)
+        preserve_factor = 1.0 - (preserve * 0.92 * detail_gate).clamp(0.0, 0.95)
+    else:
+        preserve_factor = 1.0
+
     # Pass 1: 3x3 fine-grain bilateral filter (1px solver noise)
     alpha_1 = min(0.95, scale)
-    tau_1 = base_tau * max(0.85, scale / H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH)
     padded_1 = F.pad(x, (1, 1, 1, 1), mode="reflect")
     blurred_1 = F.conv2d(padded_1, kernel_2d, groups=channels)
     delta_1 = x - blurred_1
     diff_sq_1 = delta_1[:, :rgb_channels].square().mean(dim=1, keepdim=True)
-    weight_1 = torch.exp(-diff_sq_1 / (2.0 * tau_1 * tau_1))
+    weight_1 = torch.exp(-diff_sq_1 / (2.0 * tau_1 * tau_1)) * preserve_factor
     cleaned = x - (alpha_1 * weight_1) * delta_1
 
     # Pass 2: 5x5 dilated bilateral filter (2-3px clumped mid-frequency stippling in 10+ segment runs)
@@ -96,7 +157,7 @@ def _degrain_context_suffix(
         blurred_2 = F.conv2d(padded_2, kernel_2d, groups=channels, dilation=2)
         delta_2 = cleaned - blurred_2
         diff_sq_2 = delta_2[:, :rgb_channels].square().mean(dim=1, keepdim=True)
-        weight_2 = torch.exp(-diff_sq_2 / (2.0 * tau_2 * tau_2))
+        weight_2 = torch.exp(-diff_sq_2 / (2.0 * tau_2 * tau_2)) * preserve_factor
         cleaned = cleaned - (alpha_2 * weight_2) * delta_2
 
     return cleaned.permute(0, 2, 3, 1).to(dtype=orig_dtype).contiguous()
@@ -154,6 +215,7 @@ def h3_phase_aligned_context_start(
 def h3_phase_aligned_video_suffix(
     images: torch.Tensor,
     context_frames: int,
+    detail_preservation: float | None = None,
 ) -> torch.Tensor:
     """Pad to the H3 frame grid and return an encoder-phase-aligned suffix."""
     if not isinstance(images, torch.Tensor) or images.ndim != 4:
@@ -177,7 +239,7 @@ def h3_phase_aligned_video_suffix(
         int(context_frames),
     )
     suffix = images[start:].contiguous()
-    return _degrain_context_suffix(suffix)
+    return _degrain_context_suffix(suffix, detail_preservation=detail_preservation)
 
 
 def remove_output_files_by_prefix(

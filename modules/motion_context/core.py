@@ -221,9 +221,97 @@ def _audio_tail_from_latent(
     )
 
 
+def _resolve_context_detail_preservation(
+    detail_preservation: float | None = None,
+) -> float:
+    if detail_preservation is None:
+        try:
+            detail_preservation = float(
+                os.environ.get("EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION", "0.0")
+            )
+        except (TypeError, ValueError):
+            detail_preservation = 0.0
+    return max(0.0, min(1.0, float(detail_preservation)))
+
+
+def _compute_latent_detail_gate(x: torch.Tensor) -> torch.Tensor:
+    """Compute a [B*T, 1, H, W] structure-and-flow gate in [0, 1] for 5D H3 video latents.
+
+    Separates physical high-frequency details (fluid flow streams, splashes, droplets,
+    specular glints, directional strands) from parasitic digital diffusion grain:
+    1. Centered 2-step gradients (gx, gy) vanish on 1-cell Nyquist checkerboard (+ - +)
+       while responding strongly to multi-cell physical filaments and droplets.
+    2. 24-channel structure tensor anisotropy A = ((Jxx - Jyy)^2 + 4*Jxy^2) / (Jxx + Jyy + eps)^2
+       detects directional fluid filaments, streams, and splash rims.
+    3. Cross-channel droplet/specular salience with Nyquist Laplacian rejection captures
+       round fluid droplets and specular highlights above the spatial median.
+    4. Temporal flow innovation |z(t) - z(t-1)| co-located with spatial gradients captures
+       advective moving fluid across adjacent temporal tokens.
+    """
+    b, c, t, h, w = x.shape
+    mean = x.mean(dim=(2, 3, 4), keepdim=True)
+    std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
+    z = (x - mean) / std
+    flat = z.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+
+    pad = F.pad(flat, (1, 1, 1, 1), mode="reflect")
+    gx = 0.5 * (pad[:, :, 1:-1, 2:] - pad[:, :, 1:-1, :-2])
+    gy = 0.5 * (pad[:, :, 2:, 1:-1] - pad[:, :, :-2, 1:-1])
+
+    j_xx = F.avg_pool2d(gx.square().mean(dim=1, keepdim=True), kernel_size=3, stride=1, padding=1)
+    j_yy = F.avg_pool2d(gy.square().mean(dim=1, keepdim=True), kernel_size=3, stride=1, padding=1)
+    j_xy = F.avg_pool2d((gx * gy).mean(dim=1, keepdim=True), kernel_size=3, stride=1, padding=1)
+
+    trace = j_xx + j_yy
+    anisotropy = ((j_xx - j_yy).square() + 4.0 * j_xy.square()) / (trace.square() + 1e-8)
+    grad_mag = trace.clamp(min=0.0).sqrt()
+    grad_med = (
+        grad_mag.reshape(b * t, -1)
+        .median(dim=1)
+        .values.view(b * t, 1, 1, 1)
+        .clamp(min=1e-4)
+    )
+    grad_salience = ((grad_mag - 0.85 * grad_med).clamp(min=0.0) / (1.25 * grad_med)).clamp(
+        0.0, 1.5
+    )
+    aniso_score = (anisotropy * grad_salience).clamp(0.0, 1.0)
+
+    lap_x = (pad[:, :, 1:-1, 2:] - 2.0 * flat + pad[:, :, 1:-1, :-2]).abs()
+    lap_y = (pad[:, :, 2:, 1:-1] - 2.0 * flat + pad[:, :, :-2, 1:-1]).abs()
+    nyq_energy = 0.25 * (lap_x + lap_y).mean(dim=1, keepdim=True)
+    non_checker_ratio = (grad_mag / (grad_mag + nyq_energy + 1e-5)).clamp(0.0, 1.0)
+    droplet_score = (
+        ((grad_mag - 1.30 * grad_med).clamp(min=0.0) / (1.45 * grad_med))
+        * non_checker_ratio
+    ).clamp(0.0, 1.0)
+
+    detail_gate = torch.maximum(aniso_score, droplet_score)
+    if t >= 2:
+        z_dt = (z[:, :, 1:] - z[:, :, :-1]).square().mean(dim=1, keepdim=True).sqrt()
+        z_dt = (
+            torch.cat([z_dt[:, :, :1], z_dt], dim=2)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(b * t, 1, h, w)
+        )
+        z_dt_smooth = F.avg_pool2d(z_dt, kernel_size=3, stride=1, padding=1)
+        dt_med = (
+            z_dt_smooth.reshape(b * t, -1)
+            .median(dim=1)
+            .values.view(b * t, 1, 1, 1)
+            .clamp(min=1e-4)
+        )
+        flow_excess = (
+            (z_dt_smooth - 1.05 * dt_med).clamp(min=0.0) / (1.30 * dt_med)
+        ).clamp(0.0, 1.0)
+        flow_score = (flow_excess * grad_salience.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+        detail_gate = torch.maximum(detail_gate, 0.85 * flow_score)
+    return detail_gate.clamp(0.0, 1.0)
+
+
 def _sanitize_context_video_latent(
     video: torch.Tensor,
     strength: float | None = None,
+    detail_preservation: float | None = None,
 ) -> torch.Tensor:
     """Damp high-frequency latent checkerboard grain, soft-clamp spikes, and anchor std."""
     if (
@@ -248,18 +336,28 @@ def _sanitize_context_video_latent(
     scale = max(0.0, min(2.0, float(strength)))
     if scale <= 0.0:
         return video
+    preserve = _resolve_context_detail_preservation(detail_preservation)
 
     orig_dtype = video.dtype
     x = video.float()
     b, c, t, h, w = x.shape
-    # 1. Per-channel soft-knee outlier clamp to stop variance spikes
+    if preserve > 0.0:
+        gate_bt = _compute_latent_detail_gate(x)
+        gate_5d = gate_bt.reshape(b, t, 1, h, w).permute(0, 2, 1, 3, 4)
+    else:
+        gate_bt = None
+        gate_5d = None
+
+    # 1. Per-channel soft-knee outlier clamp to stop variance spikes (relaxed on coherent fluid/specular glints)
     mean = x.mean(dim=(2, 3, 4), keepdim=True)
     std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
     z = (x - mean) / std
-    knee = max(2.8, 3.8 - 0.5 * max(0.0, scale - 0.65))
+    base_knee = max(2.8, 3.8 - 0.5 * max(0.0, scale - 0.65))
+    knee = base_knee + (1.8 * preserve) * gate_5d if gate_5d is not None else base_knee
     excess = (z.abs() - knee).clamp(min=0.0)
     z_clamped = z.sign() * (
-        z.abs().clamp(max=knee) + torch.tanh(excess * 0.5) * 1.8
+        torch.minimum(z.abs(), torch.as_tensor(knee, device=z.device, dtype=z.dtype))
+        + torch.tanh(excess * 0.5) * 1.8
     )
     x = mean + z_clamped * std
 
@@ -272,7 +370,7 @@ def _sanitize_context_video_latent(
         x = mean + (x - mean) * (anchored_std / global_std)
         std = x.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)
 
-    # 3. Edge-preserving spatial high-frequency damping across (H_lat, W_lat)
+    # 3. Edge- and flow-preserving spatial high-frequency damping across (H_lat, W_lat)
     alpha_lat = min(0.75, 0.25 * (scale / 0.65))
     flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
     kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=x.device, dtype=torch.float32)
@@ -283,6 +381,8 @@ def _sanitize_context_video_latent(
     tau_factor = 0.35 * max(0.85, scale / 0.65)
     tau_sq = (tau_factor * std.permute(0, 2, 1, 3, 4).expand(b, t, c, 1, 1).reshape(b * t, c, 1, 1)).square()
     weight = torch.exp(-delta.square() / (2.0 * tau_sq))
+    if gate_bt is not None:
+        weight = weight * (1.0 - (0.92 * preserve * gate_bt).clamp(0.0, 0.95))
     cleaned = flat - (alpha_lat * weight) * delta
     return cleaned.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4).to(dtype=orig_dtype).contiguous()
 
@@ -290,12 +390,16 @@ def _sanitize_context_video_latent(
 def trim_motion_context_latent(
     latent: dict[str, Any],
     context_length: int | str = "22",
+    detail_preservation: float | None = None,
 ) -> dict[str, Any]:
     """Copy only the H3 AV tail needed by the next context segment to CPU."""
     frame_count = int(context_length)
     video, start, steps, covered = _video_tail_bounds(latent, frame_count)
     audio, _, _ = _audio_tail_from_latent(latent, covered)
-    video = _sanitize_context_video_latent(video[:1, :, start : start + steps].detach())
+    video = _sanitize_context_video_latent(
+        video[:1, :, start : start + steps].detach(),
+        detail_preservation=detail_preservation,
+    )
     streams = tuple(
         stream.detach().to(device="cpu", copy=True).contiguous()
         for stream in (video, audio)
@@ -308,7 +412,10 @@ def trim_motion_context_latent(
                 "easy h3 motion context: anchor_samples must be a video latent"
             )
         output["anchor_samples"] = (
-            _sanitize_context_video_latent(anchor_samples.detach())
+            _sanitize_context_video_latent(
+                anchor_samples.detach(),
+                detail_preservation=detail_preservation,
+            )
             .to(device="cpu", copy=True)
             .contiguous()
         )
@@ -682,6 +789,7 @@ def _reset_context_blocks_to_ref(
     conditioning: Any = None,
     reset_denoise: float | None = None,
     seed: int = 0,
+    detail_preservation: float | None = None,
 ) -> list[torch.Tensor]:
     """Perform a 3-band spectral pose-only bottleneck + orthogonal Gaussian noise re-materialization reset.
 
@@ -691,6 +799,9 @@ def _reset_context_blocks_to_ref(
     3. Position-aware sacrificial prefix disruption (stronger reset on disposable prefix tokens t=0..t-3,
        optional <Picture 1> seeding at the head) + deterministic orthogonal Gaussian noise injection
        (eps_perp orthogonalized against the degraded signal) to force fresh feature synthesis from minimax_refs.
+    4. Optional Structure- & Flow-Preserving Spectral Gate (detail_preservation > 0): preserves anisotropic
+       fluid filaments, droplets/specular glints, and advective flow trajectories across t=3..6 while still
+       scrubbing isotropic digital grain and static anatomical distortion at full strength.
     """
     r = _resolve_context_reset_denoise(reset_denoise)
     if r <= 0.0 or not blocks:
@@ -704,6 +815,7 @@ def _reset_context_blocks_to_ref(
     ):
         return blocks
 
+    preserve = _resolve_context_detail_preservation(detail_preservation)
     orig_dtype = first.dtype
     cat = torch.cat(blocks, dim=2).float()
     b, c, t, h, w = cat.shape
@@ -786,6 +898,24 @@ def _reset_context_blocks_to_ref(
     d_mid_bt = d_mid_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
     eta_bt = eta_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
 
+    preserve_mask_bt: torch.Tensor | None = None
+    if preserve > 0.0:
+        gate_bt = _compute_latent_detail_gate(cat)
+        gamma_vec = torch.full((t,), 0.45, device=cat.device, dtype=torch.float32)
+        if t >= 1:
+            gamma_vec[t - 1] = 0.95
+        if t >= 2:
+            gamma_vec[t - 2] = 0.90
+        if t >= 3:
+            gamma_vec[t - 3] = 0.80
+        if t >= 4:
+            gamma_vec[t - 4] = 0.68
+        gamma_bt = gamma_vec.unsqueeze(0).expand(b, t).reshape(b * t, 1, 1, 1)
+        preserve_mask_bt = (preserve * gamma_bt * gate_bt).clamp(0.0, 0.92)
+        d_high_bt = d_high_bt * (1.0 - preserve_mask_bt)
+        d_mid_bt = d_mid_bt * (1.0 - 0.90 * preserve_mask_bt)
+        eta_bt = eta_bt * (1.0 - preserve_mask_bt)
+
     removed = d_mid_bt * z_mid + d_high_bt * z_high
     retained = z_low + (1.0 - d_mid_bt) * z_mid + (1.0 - d_high_bt) * z_high
 
@@ -818,8 +948,17 @@ def _reset_context_blocks_to_ref(
             dtype=torch.float32,
         )
         if ref_lat is not None:
+            preserve_5d = (
+                preserve_mask_bt.reshape(b, t, 1, h, w).permute(0, 2, 1, 3, 4)
+                if preserve_mask_bt is not None
+                else None
+            )
             for idx in range(min(2, t - 3)):
-                w_seed = min(0.65, 1.25 * r) * (1.0 - 0.45 * float(idx))
+                w_seed_val = min(0.65, 1.25 * r) * (1.0 - 0.45 * float(idx))
+                if preserve_5d is not None:
+                    w_seed = w_seed_val * (1.0 - 0.75 * preserve_5d[:, :, idx : idx + 1])
+                else:
+                    w_seed = w_seed_val
                 cleaned[:, :, idx : idx + 1] = (
                     (1.0 - w_seed) * cleaned[:, :, idx : idx + 1] + w_seed * ref_lat
                 )
@@ -836,6 +975,7 @@ def _reencoded_anchor_av_latent(
     reset_denoise: float | None = None,
     conditioning: Any = None,
     is_second_pass: bool = False,
+    detail_preservation: float | None = None,
 ) -> dict[str, Any]:
     """Pin a short re-encoded video anchor at the end of a soft prefix, optionally releasing fine texture."""
     context_steps = _steps_for_frames(int(context_frames))
@@ -871,7 +1011,12 @@ def _reencoded_anchor_av_latent(
     r = _resolve_context_reset_denoise(reset_denoise)
     has_spatial_room = int(target_video.shape[3]) >= 8 and int(target_video.shape[4]) >= 8
     if r > 0.0 and has_spatial_room:
-        blocks = _reset_context_blocks_to_ref(blocks, conditioning=conditioning, reset_denoise=r)
+        blocks = _reset_context_blocks_to_ref(
+            blocks,
+            conditioning=conditioning,
+            reset_denoise=r,
+            detail_preservation=detail_preservation,
+        )
     anchor_video = torch.cat(blocks, dim=2)
     if covered != int(anchor_frames):
         raise RuntimeError("easy h3 anchor context: video anchor span changed")
@@ -974,6 +1119,7 @@ def apply_reencoded_anchor_motion_context(
     context_length: int | str = "22",
     anchor_length: int | str = str(REENCODED_ANCHOR_FRAMES),
     reset_denoise: float | None = None,
+    detail_preservation: float | None = None,
 ) -> tuple[Any, int, dict[str, Any]]:
     """Use long native Motion Context with a short video anchor."""
     output, trim_frames = apply_motion_context(
@@ -984,6 +1130,7 @@ def apply_reencoded_anchor_motion_context(
         audio_context_length=0,
         context_latent=context_latent,
         reset_denoise=reset_denoise,
+        detail_preservation=detail_preservation,
     )
     video_keyframes, audio_keyframes = _native_keyframe_stats(output)
     if video_keyframes < 1 or audio_keyframes < 1:
@@ -999,6 +1146,7 @@ def apply_reencoded_anchor_motion_context(
         anchor_frames=int(anchor_length),
         reset_denoise=reset_denoise,
         conditioning=conditioning,
+        detail_preservation=detail_preservation,
     )
     return output, trim_frames, anchored
 
@@ -1140,6 +1288,7 @@ def apply_hires_anchor_continuity(
     anchor_length: int | str = str(REENCODED_ANCHOR_FRAMES),
     reset_denoise: float | None = None,
     conditioning: Any = None,
+    detail_preservation: float | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Pin a re-encoded boundary anchor during ordinary hi-res refine."""
     output = _reencoded_anchor_av_latent(
@@ -1153,6 +1302,7 @@ def apply_hires_anchor_continuity(
         reset_denoise=reset_denoise,
         conditioning=conditioning,
         is_second_pass=True,
+        detail_preservation=detail_preservation,
     )
     masks = _streams_from_latent({"samples": output["noise_mask"]})
     samples = _streams_from_latent(output)
@@ -1175,6 +1325,7 @@ def apply_motion_context(
     audio_vae: Any | None = None,
     context_audio: dict[str, Any] | None = None,
     reset_denoise: float | None = None,
+    detail_preservation: float | None = None,
 ) -> tuple[Any, int]:
     """Attach previous-clip video/audio tails to MiniMax H3 conditioning."""
     target_video = _video_from_latent(latent)
@@ -1257,6 +1408,7 @@ def apply_motion_context(
         blocks,
         conditioning=conditioning,
         reset_denoise=reset_denoise,
+        detail_preservation=detail_preservation,
     )
 
     r = _resolve_context_reset_denoise(reset_denoise)
@@ -1398,6 +1550,7 @@ def apply_outgoing_tail_constraint(
     end_constraint_strength: float = 0.75,
     reset_denoise: float | None = None,
     is_second_pass: bool = False,
+    detail_preservation: float | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Pin the opening frames of segment N+1 at the post-delivery overhang boundary (trim_frames + delivered_frames)."""
     s_strength = max(0.0, min(1.0, float(end_constraint_strength)))
@@ -1453,7 +1606,10 @@ def apply_outgoing_tail_constraint(
         encoded_kf = vae.encode(head_clip)
         if getattr(encoded_kf, "ndim", 0) != 5:
             raise ValueError("easy h3 outgoing constraint: video VAE returned a non-H3 latent")
-        encoded_kf = _sanitize_context_video_latent(encoded_kf.detach())
+        encoded_kf = _sanitize_context_video_latent(
+            encoded_kf.detach(),
+            detail_preservation=detail_preservation,
+        )
         kf_steps = int(encoded_kf.shape[2])
         kf_blocks = [encoded_kf[:, :, idx : idx + 1].clone() for idx in range(kf_steps)]
         if r_denoise > 0.0:
@@ -1461,6 +1617,7 @@ def apply_outgoing_tail_constraint(
                 kf_blocks,
                 conditioning=conditioning,
                 reset_denoise=r_denoise,
+                detail_preservation=detail_preservation,
             )
         kf_offsets = [outgoing_frame_index + off for off in _step_offsets(kf_steps)]
         outgoing_keyframes: list[dict[str, Any]] = [
@@ -1527,7 +1684,10 @@ def apply_outgoing_tail_constraint(
         parts_to_cat.append(head_clip[-1:].expand(22 - current_len, *head_clip.shape[1:]))
     phase_buffer = torch.cat(parts_to_cat, dim=0)[:22].contiguous()
     encoded_phase = vae.encode(phase_buffer)
-    encoded_phase = _sanitize_context_video_latent(encoded_phase.detach())
+    encoded_phase = _sanitize_context_video_latent(
+        encoded_phase.detach(),
+        detail_preservation=detail_preservation,
+    )
 
     want_tokens = 2 if pinned_frames >= 5 else 1
     num_stamp = min(
@@ -1547,6 +1707,7 @@ def apply_outgoing_tail_constraint(
             stamp_blocks,
             conditioning=output_conditioning,
             reset_denoise=r_denoise,
+            detail_preservation=detail_preservation,
         )
 
     output_video = target_video.clone()

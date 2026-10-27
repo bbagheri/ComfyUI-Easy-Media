@@ -239,6 +239,7 @@ def prepare_context_swap_latent(
     reset_denoise: float | None = None,
     conditioning: Any = None,
     seed: int = 0,
+    detail_preservation: float | None = None,
 ) -> tuple[dict[str, Any], int, int]:
     """Copy a clean predecessor prefix without modifying the predecessor latent.
 
@@ -286,6 +287,7 @@ def prepare_context_swap_latent(
             conditioning=conditioning,
             reset_denoise=r,
             seed=int(seed),
+            detail_preservation=detail_preservation,
         )
     copied_video = torch.cat(blocks, dim=2)
     video_steps = int(copied_video.shape[2])
@@ -526,6 +528,7 @@ def apply_context_swap_drift_control(
     reset_denoise: float | None = None,
     conditioning: Any = None,
     seed: int = 0,
+    detail_preservation: float | None = None,
 ) -> tuple[Any, dict[str, Any], int]:
     """Prepare the disposable AV prefix and return a Drift-Control patched model."""
     prepared, trim_frames, video_steps = prepare_context_swap_latent(
@@ -537,6 +540,7 @@ def apply_context_swap_drift_control(
         reset_denoise=reset_denoise,
         conditioning=conditioning,
         seed=int(seed),
+        detail_preservation=detail_preservation,
     )
     patched_model = install_drift_control_av_model(
         model,

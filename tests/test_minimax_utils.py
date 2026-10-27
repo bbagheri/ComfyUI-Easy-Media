@@ -153,3 +153,36 @@ def test_degrain_context_suffix_damps_micro_grain_and_preserves_edges():
     edge_diff = (cleaned_edge[:, :, 16, :] - cleaned_edge[:, :, 15, :]).mean().item()
     assert edge_diff > 0.84
 
+
+def test_degrain_context_suffix_structure_preserving_gate_keeps_fluid_filaments():
+    module = _load_minimax_utils()
+    base = torch.full((5, 32, 32, 3), 0.5, dtype=torch.float32)
+    # Moving low-contrast vertical fluid filament (advancing 1px per frame)
+    fluid = base.clone()
+    for t in range(5):
+        col = 12 + t
+        fluid[t, 6:26, col : col + 2, :] += 0.022
+
+    # Compare uniform de-graining (detail_preservation=0.0) vs structure-preserving (0.80)
+    cleaned_uniform = module._degrain_context_suffix(
+        fluid, strength=0.45, detail_preservation=0.0
+    )
+    cleaned_preserved = module._degrain_context_suffix(
+        fluid, strength=0.45, detail_preservation=0.80
+    )
+    filament_mask = fluid > 0.51
+    retained_uniform = (cleaned_uniform[filament_mask] - 0.5).mean().item()
+    retained_preserved = (cleaned_preserved[filament_mask] - 0.5).mean().item()
+    assert retained_preserved > retained_uniform * 1.15
+
+    # Verify 1px checkerboard noise is still scrubbed with detail_preservation=0.80
+    checker = (
+        (torch.arange(32).view(-1, 1) + torch.arange(32).view(1, -1)) % 2 * 2 - 1
+    ).float() * 0.012
+    noisy = base + checker.view(1, 32, 32, 1)
+    cleaned_noisy = module._degrain_context_suffix(
+        noisy, strength=0.35, detail_preservation=0.80
+    )
+    assert (cleaned_noisy - base).pow(2).mean() < (noisy - base).pow(2).mean() * 0.35
+
+

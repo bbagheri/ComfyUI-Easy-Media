@@ -203,6 +203,7 @@ def _h3_encode_context_media(
     node_prefix: str,
     context_frames: int = 22,
     degrain_strength: float | None = None,
+    detail_preservation: float | None = None,
 ) -> Any:
     """Encode a phase-aligned video suffix and the delivered audio timeline."""
     trim_kwargs: dict[str, Any] = {
@@ -214,6 +215,8 @@ def _h3_encode_context_media(
     }
     if degrain_strength is not None:
         trim_kwargs["degrain_strength"] = float(degrain_strength)
+    if detail_preservation is not None:
+        trim_kwargs["detail_preservation"] = float(detail_preservation)
     video_tail = graph.node(
         "easy h3ContextMediaTrim",
         id=f"{node_prefix}_encode_trim",
@@ -1066,6 +1069,23 @@ class EasyMultiTrackProject(io.ComfyNode):
                         "while preserving chained pose/motion/audio)."
                     ),
                 ),
+                io.Float.Input(
+                    "context_detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    round=0.01,
+                    extra_dict={"precision": 2},
+                    optional=True,
+                    tooltip=(
+                        "Structure- and flow-preserving gate strength at segment "
+                        "boundaries (0.0 = uniform spectral/bilateral filtering, "
+                        "0.50 = default preservation of anisotropic fluid streams, "
+                        "droplets, specular glints, and moving flow trajectories "
+                        "without reintroducing digital grain)."
+                    ),
+                ),
                 io.Combo.Input(
                     "end_constraint_mode",
                     options=["auto_when_next_exists", "always_when_next_exists", "off"],
@@ -1205,6 +1225,12 @@ class EasyMultiTrackProject(io.ComfyNode):
                 _first_input(kwargs.get("context_reset_denoise"), 0.35),
             )
         )
+        context_detail_preservation = float(
+            _first_input(
+                sampling_config.get("context_detail_preservation"),
+                _first_input(kwargs.get("context_detail_preservation"), 0.50),
+            )
+        )
         end_constraint_mode = str(
             _first_input(
                 sampling_config.get("end_constraint_mode"),
@@ -1222,6 +1248,7 @@ class EasyMultiTrackProject(io.ComfyNode):
         os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(context_degrain_strength)
         os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(context_degrain_strength)
         os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(context_reset_denoise)
+        os.environ["EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION"] = str(context_detail_preservation)
         second_model = model
         second_model_loader = None
         if run_second_pass or is_selflift:
@@ -1605,6 +1632,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                     graph, passthrough.out(1), passthrough.out(2), vae, audio_vae,
                     f"passthrough_context_{task_index}",
                     degrain_strength=context_degrain_strength,
+                    detail_preservation=context_detail_preservation,
                 )
                 runtime_context_latent = graph.node(
                     "easy h3MotionContextLatentTrim",
@@ -1612,6 +1640,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                     latent=context_latent,
                     context_length=str(H3_CONTEXT_SOURCE_FRAMES),
                     degrain_strength=context_degrain_strength,
+                    detail_preservation=context_detail_preservation,
                 ).out(0)
                 saved_video_end = graph.node(
                     "easy h3SegmentSaveEnd",
@@ -1870,6 +1899,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         continue_audio=True,
                         freeze_audio=False,
                         reset_denoise=context_reset_denoise,
+                        detail_preservation=context_detail_preservation,
                         conditioning=positive,
                     )
                     first_pass_sampling_model = context_swap.out(0)
@@ -1889,6 +1919,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         audio_transition_steps=4,
                         video_anchor_only=not audio_only,
                         reset_denoise=context_reset_denoise,
+                        detail_preservation=context_detail_preservation,
                     )
                     positive = motion_context.out(0)
                     first_pass_context_trim_frames = motion_context.out(1)
@@ -1934,6 +1965,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                     delivered_frames=base_task_length,
                     end_constraint_strength=effective_end_constraint_strength,
                     reset_denoise=context_reset_denoise,
+                    detail_preservation=context_detail_preservation,
                     is_second_pass=False,
                 )
                 positive = outgoing_pass1.out(0)
@@ -2138,6 +2170,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         video_transition_steps=4,
                         video_anchor_only=not audio_only,
                         reset_denoise=context_reset_denoise,
+                        detail_preservation=context_detail_preservation,
                         conditioning=second_pass_positive,
                     )
                     upscaled_latent = hires_continuity.out(0)
@@ -2161,6 +2194,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         delivered_frames=base_task_length,
                         end_constraint_strength=effective_end_constraint_strength,
                         reset_denoise=context_reset_denoise,
+                        detail_preservation=context_detail_preservation,
                         is_second_pass=True,
                     )
                     second_pass_positive = outgoing_pass2.out(0)
@@ -2350,6 +2384,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         audio_vae,
                         f"hires_context_{task_index}",
                         degrain_strength=context_degrain_strength,
+                        detail_preservation=context_detail_preservation,
                     )
                     hires_context_reencoded = True
                     if (has_second_pass and run_second_pass) or (
@@ -2394,6 +2429,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                             audio_vae,
                             f"low_context_{task_index}",
                             degrain_strength=context_degrain_strength,
+                            detail_preservation=context_detail_preservation,
                         )
                         low_context_reencoded = True
                     else:
@@ -2432,6 +2468,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                 "latent": saved_hires_context_latent,
                 "context_length": str(context_source_frames),
                 "degrain_strength": context_degrain_strength,
+                "detail_preservation": context_detail_preservation,
             }
             if not audio_only and not hires_context_reencoded:
                 hires_trim_inputs.update({"anchor_images": output_images, "vae": vae})
@@ -2445,6 +2482,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                     "latent": saved_low_context_latent,
                     "context_length": str(context_source_frames),
                     "degrain_strength": context_degrain_strength,
+                    "detail_preservation": context_detail_preservation,
                 }
                 if not audio_only and not low_context_reencoded:
                     low_anchor_images = low_delivered_images

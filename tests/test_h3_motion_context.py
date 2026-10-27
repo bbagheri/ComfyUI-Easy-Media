@@ -521,3 +521,56 @@ def test_hires_anchor_continuity_second_pass_blends_pass1_and_boosts_release_mas
     assert 0.24 <= float(video_mask[0, 0, 6, 0, 0]) <= 0.35
     assert float(video_mask[0, 0, 6, 0, 0]) < float(video_mask[0, 0, 5, 0, 0])
     assert torch.all(audio_mask == 0)
+
+
+def test_structure_preserving_latent_reset_retains_anisotropic_fluid_flow_while_scrubbing_noise():
+    # Build a 7-step latent [1, 24, 7, 16, 16] containing an anisotropic moving fluid stream
+    # in cols 7..8 that advances downward over t=3..6, plus isotropic background micro-grain
+    x = torch.zeros((1, 24, 7, 16, 16), dtype=torch.float32)
+    for t in range(7):
+        y_start = 2 + t
+        x[:, :12, t, y_start : y_start + 6, 7:9] = 1.8
+        x[:, 12:, t, y_start : y_start + 6, 7:9] = -1.4
+
+    # Add 1-cell alternating Nyquist checkerboard grain on the background (cols 1..4)
+    checker = (
+        (torch.arange(16).view(-1, 1) + torch.arange(16).view(1, -1)) % 2 * 2 - 1
+    ).float() * 0.35
+    bg_mask = torch.zeros((16, 16), dtype=torch.bool)
+    bg_mask[2:14, 1:5] = True
+    x[:, :, :, bg_mask] += checker[bg_mask].view(1, 1, 1, -1)
+
+    ref_latent = torch.zeros((1, 24, 1, 16, 16), dtype=torch.float32)
+
+    reset_uniform = core._reset_context_blocks_to_ref(
+        x,
+        ref_latent,
+        reset_denoise=0.45,
+        seed=0,
+        noise_scale=0.0,
+        detail_preservation=0.0,
+    )
+    reset_preserved = core._reset_context_blocks_to_ref(
+        x,
+        ref_latent,
+        reset_denoise=0.45,
+        seed=0,
+        noise_scale=0.0,
+        detail_preservation=0.85,
+    )
+
+    # Along the moving fluid stream in t=4..6, structure-preserving reset retains significantly
+    # higher detail amplitude than uniform reset
+    stream_energy_uniform = float(
+        reset_uniform[:, :, 4:7, 6:12, 7:9].abs().mean()
+    )
+    stream_energy_preserved = float(
+        reset_preserved[:, :, 4:7, 6:12, 7:9].abs().mean()
+    )
+    assert stream_energy_preserved > stream_energy_uniform * 1.15
+
+    # Meanwhile, 1-cell alternating Nyquist checkerboard on the background is scrubbed
+    bg_initial_energy = float(x[:, :, 3:6, 2:14, 1:5].pow(2).mean())
+    bg_preserved_energy = float(reset_preserved[:, :, 3:6, 2:14, 1:5].pow(2).mean())
+    assert bg_preserved_energy < bg_initial_energy * 0.35
+

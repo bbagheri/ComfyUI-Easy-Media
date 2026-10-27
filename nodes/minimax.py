@@ -934,6 +934,19 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
                         "0.35=reset micro-texture from reference images while keeping pose)."
                     ),
                 ),
+                io.Float.Input(
+                    "detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                    tooltip=(
+                        "Structure- and flow-preserving spectral gate strength "
+                        "(0.0=uniform reset, 0.50=preserve anisotropic fluid filaments, "
+                        "droplets, and moving flow trajectories while scrubbing digital grain)."
+                    ),
+                ),
             ],
             outputs=[
                 io.Conditioning.Output("conditioning"),
@@ -954,12 +967,17 @@ class EasyMiniMaxH3MotionContextHard(io.ComfyNode):
         audio_transition_steps: int = 4,
         video_anchor_only: bool = True,
         reset_denoise: float | None = None,
+        detail_preservation: float | None = None,
     ) -> io.NodeOutput:
         if reset_denoise is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
+        if detail_preservation is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION"] = str(float(detail_preservation))
         extra_kwargs: dict[str, Any] = {}
         if reset_denoise is not None:
             extra_kwargs["reset_denoise"] = reset_denoise
+        if detail_preservation is not None:
+            extra_kwargs["detail_preservation"] = detail_preservation
         if video_anchor_only:
             output, trim_frames, hard_latent = (
                 apply_reencoded_anchor_motion_context(
@@ -1055,6 +1073,14 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Float.Input(
+                    "detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
                 io.Conditioning.Input("conditioning", optional=True),
             ],
             outputs=[
@@ -1078,9 +1104,15 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
         freeze_audio: bool = False,
         reset_denoise: float | None = None,
         conditioning: Any = None,
+        detail_preservation: float | None = None,
     ) -> io.NodeOutput:
         if reset_denoise is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
+        if detail_preservation is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION"] = str(float(detail_preservation))
+        extra_kwargs: dict[str, Any] = {}
+        if detail_preservation is not None:
+            extra_kwargs["detail_preservation"] = detail_preservation
         patched_model, prepared_latent, trim_frames = (
             apply_context_swap_drift_control(
                 model=model,
@@ -1093,6 +1125,7 @@ class EasyMiniMaxH3ContextSwap(io.ComfyNode):
                 reset_denoise=reset_denoise,
                 conditioning=conditioning,
                 seed=int(seed),
+                **extra_kwargs,
             )
         )
         return io.NodeOutput(patched_model, prepared_latent, trim_frames)
@@ -1134,6 +1167,14 @@ class EasyMiniMaxH3HiResContinuity(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Float.Input(
+                    "detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
                 io.Conditioning.Input("conditioning", optional=True),
             ],
             outputs=[
@@ -1152,15 +1193,20 @@ class EasyMiniMaxH3HiResContinuity(io.ComfyNode):
         video_anchor_only: bool = True,
         reset_denoise: float | None = None,
         conditioning: Any = None,
+        detail_preservation: float | None = None,
     ) -> io.NodeOutput:
         if reset_denoise is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_RESET_DENOISE"] = str(float(reset_denoise))
+        if detail_preservation is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION"] = str(float(detail_preservation))
         if video_anchor_only:
             extra_kwargs: dict[str, Any] = {}
             if reset_denoise is not None:
                 extra_kwargs["reset_denoise"] = reset_denoise
             if conditioning is not None:
                 extra_kwargs["conditioning"] = conditioning
+            if detail_preservation is not None:
+                extra_kwargs["detail_preservation"] = detail_preservation
             output, trim_frames = apply_hires_anchor_continuity(
                 current_hires_latent=current_hires_latent,
                 previous_hires_latent=previous_hires_latent,
@@ -1208,6 +1254,14 @@ class EasyH3MotionContextLatentTrim(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Float.Input(
+                    "detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
             ],
             outputs=[io.Latent.Output("context_latent")],
             is_dev_only=True,
@@ -1221,11 +1275,17 @@ class EasyH3MotionContextLatentTrim(io.ComfyNode):
         anchor_images: torch.Tensor | None = None,
         vae: Any | None = None,
         degrain_strength: float | None = None,
+        detail_preservation: float | None = None,
     ) -> io.NodeOutput:
         if degrain_strength is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(float(degrain_strength))
             os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(float(degrain_strength))
-        output = trim_motion_context_latent(latent, context_length=context_length)
+        if detail_preservation is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION"] = str(float(detail_preservation))
+        trim_kwargs: dict[str, Any] = {"context_length": context_length}
+        if detail_preservation is not None:
+            trim_kwargs["detail_preservation"] = detail_preservation
+        output = trim_motion_context_latent(latent, **trim_kwargs)
         if (anchor_images is None) != (vae is None):
             raise ValueError("anchor_images and vae must be connected together")
         if anchor_images is not None and vae is not None:
@@ -1234,9 +1294,13 @@ class EasyH3MotionContextLatentTrim(io.ComfyNode):
             if int(anchor_images.shape[0]) < REENCODED_ANCHOR_FRAMES:
                 raise ValueError("H3 context anchor requires at least five frames")
             try:
+                suffix_kwargs: dict[str, Any] = {}
+                if detail_preservation is not None:
+                    suffix_kwargs["detail_preservation"] = detail_preservation
                 anchor_pixels = h3_phase_aligned_video_suffix(
                     anchor_images,
                     REENCODED_ANCHOR_FRAMES,
+                    **suffix_kwargs,
                 )
                 anchor_samples = vae.encode(
                     anchor_pixels[:, :, :, :3]
@@ -1410,6 +1474,14 @@ class EasyMiniMaxH3OutgoingConstraint(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Float.Input(
+                    "detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
                 io.Boolean.Input("is_second_pass", default=False, optional=True),
                 io.Image.Input("outgoing_images", optional=True),
                 io.Audio.Input("outgoing_audio", optional=True),
@@ -1432,11 +1504,15 @@ class EasyMiniMaxH3OutgoingConstraint(io.ComfyNode):
         delivered_frames: int = 1,
         end_constraint_strength: float = 0.75,
         reset_denoise: float = 0.25,
+        detail_preservation: float | None = None,
         is_second_pass: bool = False,
         outgoing_images: torch.Tensor | None = None,
         outgoing_audio: dict[str, Any] | None = None,
         audio_vae: Any | None = None,
     ) -> io.NodeOutput:
+        extra_kwargs: dict[str, Any] = {}
+        if detail_preservation is not None:
+            extra_kwargs["detail_preservation"] = float(detail_preservation)
         output_conditioning, output_latent = apply_outgoing_tail_constraint(
             conditioning=conditioning,
             vae=vae,
@@ -1449,6 +1525,7 @@ class EasyMiniMaxH3OutgoingConstraint(io.ComfyNode):
             end_constraint_strength=float(end_constraint_strength),
             reset_denoise=float(reset_denoise if reset_denoise is not None else 0.25),
             is_second_pass=bool(is_second_pass),
+            **extra_kwargs,
         )
         return io.NodeOutput(output_conditioning, output_latent)
 
@@ -2410,6 +2487,14 @@ class EasyH3ContextMediaTrim(io.ComfyNode):
                     step=0.05,
                     optional=True,
                 ),
+                io.Float.Input(
+                    "detail_preservation",
+                    default=0.50,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                ),
             ],
             outputs=[
                 io.Image.Output("images"),
@@ -2430,15 +2515,21 @@ class EasyH3ContextMediaTrim(io.ComfyNode):
         fit_video_duration: bool = False,
         fps: float = 24.0,
         degrain_strength: float | None = None,
+        detail_preservation: float | None = None,
     ) -> io.NodeOutput:
         if degrain_strength is not None:
             os.environ["EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH"] = str(float(degrain_strength))
             os.environ["EASYMEDIA_H3_LATENT_SANITIZE_STRENGTH"] = str(float(degrain_strength))
+        if detail_preservation is not None:
+            os.environ["EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION"] = str(float(detail_preservation))
         prefix = max(0, int(trim_frames))
         wanted_frames = max(1, int(output_frames))
         if bool(phase_align_video_encode):
+            suffix_kwargs: dict[str, Any] = {}
+            if detail_preservation is not None:
+                suffix_kwargs["detail_preservation"] = detail_preservation
             return io.NodeOutput(
-                h3_phase_aligned_video_suffix(images, wanted_frames),
+                h3_phase_aligned_video_suffix(images, wanted_frames, **suffix_kwargs),
                 audio,
             )
 
