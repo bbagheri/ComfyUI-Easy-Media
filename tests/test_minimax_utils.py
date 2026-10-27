@@ -165,15 +165,15 @@ def test_degrain_context_suffix_structure_preserving_gate_keeps_fluid_filaments(
 
     # Compare uniform de-graining (detail_preservation=0.0) vs structure-preserving (0.80)
     cleaned_uniform = module._degrain_context_suffix(
-        fluid, strength=0.45, detail_preservation=0.0
+        fluid, strength=0.65, detail_preservation=0.0
     )
     cleaned_preserved = module._degrain_context_suffix(
-        fluid, strength=0.45, detail_preservation=0.80
+        fluid, strength=0.65, detail_preservation=0.80
     )
     filament_mask = fluid > 0.51
-    retained_uniform = (cleaned_uniform[filament_mask] - 0.5).mean().item()
-    retained_preserved = (cleaned_preserved[filament_mask] - 0.5).mean().item()
-    assert retained_preserved > retained_uniform * 1.15
+    loss_uniform = (fluid[filament_mask] - cleaned_uniform[filament_mask]).abs().mean().item()
+    loss_preserved = (fluid[filament_mask] - cleaned_preserved[filament_mask]).abs().mean().item()
+    assert loss_preserved < loss_uniform * 0.35
 
     # Verify 1px checkerboard noise is still scrubbed with detail_preservation=0.80
     checker = (

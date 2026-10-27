@@ -540,27 +540,31 @@ def test_structure_preserving_latent_reset_retains_anisotropic_fluid_flow_while_
     bg_mask[2:14, 1:5] = True
     x[:, :, :, bg_mask] += checker[bg_mask].view(1, 1, 1, -1)
 
-    ref_latent = torch.zeros((1, 24, 1, 16, 16), dtype=torch.float32)
+    blocks = [x[:, :, t : t + 1].clone() for t in range(7)]
 
-    reset_uniform = core._reset_context_blocks_to_ref(
-        x,
-        ref_latent,
-        reset_denoise=0.45,
-        seed=0,
-        noise_scale=0.0,
-        detail_preservation=0.0,
+    reset_uniform = torch.cat(
+        core._reset_context_blocks_to_ref(
+            [b.clone() for b in blocks],
+            conditioning=None,
+            reset_denoise=0.45,
+            seed=0,
+            detail_preservation=0.0,
+        ),
+        dim=2,
     )
-    reset_preserved = core._reset_context_blocks_to_ref(
-        x,
-        ref_latent,
-        reset_denoise=0.45,
-        seed=0,
-        noise_scale=0.0,
-        detail_preservation=0.85,
+    reset_preserved = torch.cat(
+        core._reset_context_blocks_to_ref(
+            [b.clone() for b in blocks],
+            conditioning=None,
+            reset_denoise=0.45,
+            seed=0,
+            detail_preservation=0.85,
+        ),
+        dim=2,
     )
 
     # Along the moving fluid stream in t=4..6, structure-preserving reset retains significantly
-    # higher detail amplitude than uniform reset
+    # higher stream contrast than uniform reset
     stream_energy_uniform = float(
         reset_uniform[:, :, 4:7, 6:12, 7:9].abs().mean()
     )
@@ -570,7 +574,16 @@ def test_structure_preserving_latent_reset_retains_anisotropic_fluid_flow_while_
     assert stream_energy_preserved > stream_energy_uniform * 1.15
 
     # Meanwhile, 1-cell alternating Nyquist checkerboard on the background is scrubbed
-    bg_initial_energy = float(x[:, :, 3:6, 2:14, 1:5].pow(2).mean())
-    bg_preserved_energy = float(reset_preserved[:, :, 3:6, 2:14, 1:5].pow(2).mean())
-    assert bg_preserved_energy < bg_initial_energy * 0.35
+    bg_initial_diff = float(
+        (x[:, :, 3:6, 2:14, 2:5] - x[:, :, 3:6, 2:14, 1:4]).pow(2).mean()
+    )
+    bg_preserved_diff = float(
+        (
+            reset_preserved[:, :, 3:6, 2:14, 2:5]
+            - reset_preserved[:, :, 3:6, 2:14, 1:4]
+        )
+        .pow(2)
+        .mean()
+    )
+    assert bg_preserved_diff < bg_initial_diff * 0.35
 

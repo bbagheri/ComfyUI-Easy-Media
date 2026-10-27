@@ -47,7 +47,7 @@ def _compute_pixel_detail_gate(
     trace = j_xx + j_yy
     anisotropy = ((j_xx - j_yy).square() + 4.0 * j_xy.square()) / (trace.square() + 1e-8)
     grad_mag = trace.clamp(min=0.0).sqrt()
-    salience = (grad_mag / max(1e-5, tau_ref * 0.45)).clamp(0.0, 1.5)
+    salience = (grad_mag / max(1e-5, tau_ref * 0.28)).clamp(0.0, 1.5)
     aniso_score = (anisotropy * salience).clamp(0.0, 1.0)
 
     if int(rgb.shape[0]) >= 2:
@@ -55,7 +55,7 @@ def _compute_pixel_detail_gate(
         dt = torch.cat([dt[:1], dt], dim=0)
         dt_smooth = F.avg_pool2d(dt, kernel_size=3, stride=1, padding=1)
         flow_score = (
-            (dt_smooth / max(1e-5, tau_ref * 0.70)) * salience.clamp(0.0, 1.0)
+            (dt_smooth / max(1e-5, tau_ref * 0.55)) * salience.clamp(0.0, 1.0)
         ).clamp(0.0, 1.0)
         return torch.maximum(aniso_score, 0.85 * flow_score).clamp(0.0, 1.0)
     return aniso_score
