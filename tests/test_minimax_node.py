@@ -6482,3 +6482,47 @@ def test_multitrack_h3_autoregressive_run_never_adds_outgoing_constraints_when_o
         )
 
 
+def test_reference_bridge_and_fallback_pre_degrain_noisy_images_and_sanitize_latents(
+    monkeypatch,
+):
+    module = _load_minimax_node(monkeypatch)
+    assert module is not None
+    monkeypatch.setenv("EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH", "0.65")
+
+    torch.manual_seed(99)
+    clean = torch.full((1, 32, 32, 3), 0.5, dtype=torch.float32)
+    noisy = clean + (torch.randn_like(clean) * 0.025).clamp(-0.05, 0.05)
+
+    class _NoisyVae:
+        def __init__(self):
+            self.encoded_inputs = []
+
+        def encode(self, value):
+            self.encoded_inputs.append(value.clone())
+            # Return a spatial latent [1, 24, 1, 12, 12] with inflated variance (2.2)
+            torch.manual_seed(11)
+            return torch.randn(1, 24, 1, 12, 12, dtype=torch.float32) * 2.20
+
+    vae = _NoisyVae()
+    out = module.MiniMaxH3ReferenceToVideoFallback.execute(
+        clip=_Clip(),
+        vae=vae,
+        audio_vae=None,
+        prompt="prompt",
+        width=32,
+        height=32,
+        length=5,
+        ref_images={"ref_image_0": noisy},
+    )
+
+    # 1. Image passed into VAE encode has significantly reduced high-frequency grain
+    encoded_img = vae.encoded_inputs[0]
+    assert float((encoded_img - clean).pow(2).mean().item()) < float(
+        (noisy - clean).pow(2).mean().item() * 0.35
+    )
+    # 2. Stored minimax_refs latent has its inflated std (2.20) sanitized down
+    ref_lat = out.values[0][0][1]["minimax_refs"][0]["latent"]
+    assert float(ref_lat.std().item()) < 1.70
+
+
+

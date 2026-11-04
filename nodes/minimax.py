@@ -16,6 +16,7 @@ from comfy_execution.graph_utils import GraphBuilder
 
 from ..modules.motion_context.core import (
     REENCODED_ANCHOR_FRAMES,
+    _sanitize_context_video_latent,
     apply_hires_anchor_continuity,
     apply_hires_continuity,
     apply_motion_context,
@@ -50,6 +51,7 @@ from ..utils.h3_conditioning_cache import (
     touch_h3_conditioning_cache,
 )
 from ..utils.minimax import (
+    _degrain_reference_image,
     expand_image_inputs,
     flatten_media_inputs,
     h3_phase_aligned_video_suffix,
@@ -440,6 +442,51 @@ def _encode_ref_audio(
     return latent, latent.shape[-1]
 
 
+def _sanitize_h3_reference_latent(latent: Any) -> Any:
+    """Sanitize a 4D [24, T, H, W] or 5D [B, 24, T, H, W] H3 reference/keyframe video latent."""
+    if not isinstance(latent, torch.Tensor) or not torch.is_floating_point(latent):
+        return latent
+    if latent.ndim == 4 and int(latent.shape[0]) == 24:
+        return _sanitize_context_video_latent(latent.unsqueeze(0)).squeeze(0)
+    if latent.ndim == 5 and int(latent.shape[1]) == 24:
+        return _sanitize_context_video_latent(latent)
+    return latent
+
+
+def _sanitize_h3_conditioning_refs(conditioning: Any) -> Any:
+    """Sanitize minimax_refs video/image latents inside a ComfyUI conditioning list."""
+    if not isinstance(conditioning, (list, tuple)):
+        return conditioning
+    output: list[Any] = []
+    changed = False
+    for item in conditioning:
+        if not isinstance(item, (list, tuple)) or len(item) < 2 or not isinstance(item[1], dict):
+            output.append(item)
+            continue
+        meta = item[1]
+        refs = meta.get("minimax_refs")
+        if not isinstance(refs, (list, tuple)) or not refs:
+            output.append(item)
+            continue
+        new_refs: list[Any] = []
+        refs_changed = False
+        for ref in refs:
+            if isinstance(ref, dict) and isinstance(ref.get("latent"), torch.Tensor):
+                sanitized = _sanitize_h3_reference_latent(ref["latent"])
+                if sanitized is not ref["latent"]:
+                    ref = {**ref, "latent": sanitized}
+                    refs_changed = True
+            new_refs.append(ref)
+        if refs_changed:
+            new_meta = meta.copy()
+            new_meta["minimax_refs"] = new_refs
+            output.append([item[0], new_meta, *item[2:]])
+            changed = True
+        else:
+            output.append(item)
+    return output if changed else conditioning
+
+
 class MiniMaxH3ImageToVideoFallback(io.ComfyNode):
     """Compatibility copy used when ComfyUI does not ship the native H3 node."""
 
@@ -497,18 +544,22 @@ class MiniMaxH3ImageToVideoFallback(io.ComfyNode):
         token_images: list[torch.Tensor] = []
         keyframes: list[dict[str, Any]] = []
         if first_frame is not None:
-            image = _resize(first_frame[:1], width, height, "disabled")
+            cleaned_first = _degrain_reference_image(first_frame[:1])
+            image = _resize(cleaned_first, width, height, "disabled")
             token_images.append(image)
             keyframes.append({"resolved_frame_index": 0, "image": image})
         if last_frame is not None:
-            image = _resize(last_frame[:1], width, height, "center")
+            cleaned_last = _degrain_reference_image(last_frame[:1])
+            image = _resize(cleaned_last, width, height, "center")
             token_images.append(image)
             keyframes.append({"resolved_frame_index": frame_count - 1, "image": image})
 
         tokens = clip.tokenize(prompt, images=token_images)
         conditioning = clip.encode_from_tokens_scheduled(tokens)
         for keyframe in keyframes:
-            keyframe["latent"] = vae.encode(keyframe.pop("image"))
+            keyframe["latent"] = _sanitize_h3_reference_latent(
+                vae.encode(keyframe.pop("image"))
+            )
         if keyframes:
             conditioning = _set_conditioning_values(
                 conditioning,
@@ -628,7 +679,8 @@ class MiniMaxH3ReferenceToVideoFallback(io.ComfyNode):
         for image in (ref_images or {}).values():
             if image is None:
                 continue
-            image_height, image_width = image.shape[1], image.shape[2]
+            cleaned_image = _degrain_reference_image(image[:1])
+            image_height, image_width = cleaned_image.shape[1], cleaned_image.shape[2]
             if ref_image_size == "match":
                 scale = min(
                     1.0,
@@ -649,14 +701,14 @@ class MiniMaxH3ReferenceToVideoFallback(io.ComfyNode):
                 CANVAS_MULTIPLE,
                 round(image_height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE,
             )
-            resized = _resize(image[:1], resized_width, resized_height, "disabled")
+            resized = _resize(cleaned_image, resized_width, resized_height, "disabled")
             reference_items.append({"type": "image", "data": resized})
             reference_blocks.append(
                 {
                     "kind": "image",
                     "latent_h": resized_height // 16,
                     "latent_w": resized_width // 16,
-                    "latent": vae.encode(resized),
+                    "latent": _sanitize_h3_reference_latent(vae.encode(resized)),
                 }
             )
 
@@ -849,7 +901,12 @@ class EasyMiniMaxH3ReferenceToVideoBridge(io.ComfyNode):
             "MiniMaxH3ReferenceToVideo",
             MiniMaxH3ReferenceToVideoFallback,
         )
-        return target.execute(
+        if target is not MiniMaxH3ReferenceToVideoFallback:
+            grouped_inputs["ref_images"] = {
+                name: _degrain_reference_image(img) if isinstance(img, torch.Tensor) else img
+                for name, img in grouped_inputs["ref_images"].items()
+            }
+        result = target.execute(
             clip=clip,
             vae=vae,
             audio_vae=audio_vae,
@@ -860,6 +917,13 @@ class EasyMiniMaxH3ReferenceToVideoBridge(io.ComfyNode):
             ref_image_size=ref_image_size,
             **grouped_inputs,
         )
+        if target is not MiniMaxH3ReferenceToVideoFallback and hasattr(result, "values"):
+            values = list(getattr(result, "values", ()))
+            if len(values) >= 2:
+                sanitized_cond = _sanitize_h3_conditioning_refs(values[0])
+                if sanitized_cond is not values[0]:
+                    return io.NodeOutput(sanitized_cond, *values[1:])
+        return result
 
 
 def get_minimax_h3_fallback_nodes() -> list[type[io.ComfyNode]]:

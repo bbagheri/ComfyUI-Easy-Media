@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import uuid
 import weakref
@@ -57,6 +58,8 @@ def h3_encoder_signature(
         _runtime_component_token(clip),
         _runtime_component_token(vae),
         _runtime_component_token(audio_vae),
+        os.environ.get("EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH", "0.65"),
+        os.environ.get("EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION", "0.0"),
     )
     payload = json.dumps(components, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

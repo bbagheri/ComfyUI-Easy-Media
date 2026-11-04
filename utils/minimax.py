@@ -178,6 +178,162 @@ def _degrain_context_suffix(
         )
 
 
+def _degrain_reference_image(
+    images: torch.Tensor,
+    strength: float | None = None,
+    detail_preservation: float | None = None,
+) -> torch.Tensor:
+    """Apply a noise-floor-adaptive pre-degrain filter to H3 reference/keyframe images before Lanczos resize.
+
+    Self-calibrates per image using the 3x3 high-pass median absolute deviation (hp_med)
+    and the Nyquist Laplacian-to-Gradient ratio (Lap/Grad):
+    - On already-clean realistic photos (hp_med <= 0.0018, Lap/Grad <= 0.35), adapt_gain -> 0.0,
+      applying only a sub-threshold mosquito/quantization pass that leaves pores, hair strands,
+      and sharp edges intact.
+    - On un-denoised Cycles Monte Carlo renders or high-ISO images (hp_med >= 0.005, Lap/Grad >= 0.65),
+      adapt_gain -> 1.0, scrubbing 1px uncorrelated path-tracing speckle and isolated fireflies
+      before Lanczos downscaling can clump them into 2-3px mid-frequency stipple.
+    """
+    if (
+        not isinstance(images, torch.Tensor)
+        or images.ndim != 4
+        or not torch.is_floating_point(images)
+        or int(images.shape[1]) < 8
+        or int(images.shape[2]) < 8
+    ):
+        return images
+
+    if strength is None:
+        try:
+            strength = float(
+                os.environ.get(
+                    "EASYMEDIA_H3_CONTEXT_DEGRAIN_STRENGTH",
+                    str(H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH),
+                )
+            )
+        except (TypeError, ValueError):
+            strength = H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH
+    if detail_preservation is None:
+        try:
+            detail_preservation = float(
+                os.environ.get(
+                    "EASYMEDIA_H3_CONTEXT_DETAIL_PRESERVATION",
+                    "0.0",
+                )
+            )
+        except (TypeError, ValueError):
+            detail_preservation = 0.0
+
+    scale = max(0.0, min(2.0, float(strength)))
+    preserve = max(0.0, min(1.0, float(detail_preservation)))
+    if scale <= 0.0:
+        return images
+
+    orig_dtype = images.dtype
+    orig_device = images.device
+    exec_device = (
+        torch.device("cuda")
+        if (orig_device.type == "cpu" and torch.cuda.is_available())
+        else orig_device
+    )
+    with torch.no_grad():
+        x = (
+            images.to(device=exec_device, dtype=torch.float32, non_blocking=True)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        b, channels, _h, _w = x.shape
+        rgb_channels = min(3, int(channels))
+        kernel_1d = torch.tensor([0.25, 0.5, 0.25], device=exec_device, dtype=torch.float32)
+        kernel_2d = (
+            torch.outer(kernel_1d, kernel_1d)
+            .view(1, 1, 3, 3)
+            .expand(channels, 1, 3, 3)
+            .contiguous()
+        )
+
+        padded_1 = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        blurred_1 = F.conv2d(padded_1, kernel_2d, groups=channels)
+        delta_1 = x - blurred_1
+        hp_rgb = delta_1[:, :rgb_channels]
+        hp_med = (
+            hp_rgb.abs()
+            .reshape(b, -1)
+            .median(dim=1)
+            .values.view(b, 1, 1, 1)
+        )
+
+        rgb = x[:, :rgb_channels]
+        pad_rgb = padded_1[:, :rgb_channels]
+        gx = 0.5 * (pad_rgb[:, :, 1:-1, 2:] - pad_rgb[:, :, 1:-1, :-2])
+        gy = 0.5 * (pad_rgb[:, :, 2:, 1:-1] - pad_rgb[:, :, :-2, 1:-1])
+        grad = (gx.square() + gy.square()).mean(dim=1, keepdim=True).clamp(min=0.0).sqrt()
+        lap_x = (pad_rgb[:, :, 1:-1, 2:] - 2.0 * rgb + pad_rgb[:, :, 1:-1, :-2]).abs()
+        lap_y = (pad_rgb[:, :, 2:, 1:-1] - 2.0 * rgb + pad_rgb[:, :, :-2, 1:-1]).abs()
+        lap = 0.25 * (lap_x + lap_y).mean(dim=1, keepdim=True)
+        nyq_ratio = lap / (grad + 1e-4)
+        lap_grad_med = (
+            (lap / (grad + 1e-5))
+            .reshape(b, -1)
+            .median(dim=1)
+            .values.view(b, 1, 1, 1)
+        )
+
+        noise_excess = ((hp_med - 0.0018) / 0.0060).clamp(0.0, 1.0)
+        nyq_excess = ((lap_grad_med - 0.35) / 0.40).clamp(0.0, 1.0)
+        adapt_gain = torch.maximum(noise_excess, nyq_excess)
+        scale_factor = min(2.0, scale / H3_DEFAULT_CONTEXT_DEGRAIN_STRENGTH)
+
+        tau_1 = (0.008 + 0.028 * adapt_gain) * max(0.85, scale_factor)
+        alpha_1 = torch.clamp((0.20 + 0.75 * adapt_gain) * scale_factor, max=0.95)
+
+        if preserve > 0.0:
+            tau_ref = float(tau_1.mean().item())
+            detail_gate = _compute_pixel_detail_gate(x, rgb_channels, tau_ref)
+            non_checker = (grad / (grad + lap + 1e-5)).clamp(0.0, 1.0)
+            detail_gate = detail_gate * non_checker
+            # When 1px Monte Carlo noise dominates (adapt_gain -> 1), cap detail_gate protection
+            # so random noise spikes cannot shield themselves from de-graining.
+            max_preserve = (1.0 - 0.55 * adapt_gain) * 0.90
+            preserve_factor = 1.0 - torch.minimum(
+                preserve * 0.88 * detail_gate,
+                max_preserve,
+            )
+        else:
+            preserve_factor = 1.0
+
+        # Relax bilateral edge-stopping on isolated 1px fireflies where Laplacian >> 2-step gradient
+        firefly_relax = (
+            1.0 + 3.0 * adapt_gain * (nyq_ratio - 0.65).clamp(min=0.0, max=3.0).square()
+        )
+        diff_sq_1 = hp_rgb.square().mean(dim=1, keepdim=True)
+        weight_1 = (
+            torch.exp(-diff_sq_1 / (2.0 * tau_1.square() * firefly_relax))
+            * preserve_factor
+        )
+        cleaned = x - (alpha_1 * weight_1) * delta_1
+
+        # Pass 2: secondary 3x3 pass when elevated 1px Monte Carlo / ISO noise is detected
+        if float((adapt_gain * scale_factor).max().item()) > 0.35:
+            alpha_2 = torch.clamp(0.80 * adapt_gain * scale_factor, max=0.88)
+            tau_2 = tau_1 * 1.25
+            padded_2 = F.pad(cleaned, (1, 1, 1, 1), mode="reflect")
+            blurred_2 = F.conv2d(padded_2, kernel_2d, groups=channels)
+            delta_2 = cleaned - blurred_2
+            diff_sq_2 = delta_2[:, :rgb_channels].square().mean(dim=1, keepdim=True)
+            weight_2 = (
+                torch.exp(-diff_sq_2 / (2.0 * tau_2.square() * firefly_relax))
+                * preserve_factor
+            )
+            cleaned = cleaned - (alpha_2 * weight_2) * delta_2
+
+        return (
+            cleaned.permute(0, 2, 3, 1)
+            .to(device=orig_device, dtype=orig_dtype)
+            .contiguous()
+        )
+
+
 def selflift_transition_step(step_count: int, ratio: float) -> int:
     """Round a low-resolution NFE ratio to a valid SelfLift boundary."""
     if step_count < 2:

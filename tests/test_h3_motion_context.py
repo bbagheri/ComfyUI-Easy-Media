@@ -587,3 +587,27 @@ def test_structure_preserving_latent_reset_retains_anisotropic_fluid_flow_while_
     )
     assert bg_preserved_diff < bg_initial_diff * 0.35
 
+
+def test_reset_context_blocks_to_ref_never_inflates_context_std_from_high_variance_ref():
+    torch.manual_seed(7)
+    ctx = torch.randn((1, 24, 7, 12, 12), dtype=torch.float32) * 0.85
+    blocks = [ctx[:, :, t : t + 1].clone() for t in range(7)]
+    initial_std = float(ctx.std().item())
+
+    # Simulate a noisy or high-contrast collage reference latent with inflated std (2.4)
+    noisy_ref = torch.randn((1, 24, 1, 12, 12), dtype=torch.float32) * 2.40
+    conditioning = [[torch.zeros((1, 4)), {"minimax_refs": [{"latent": noisy_ref}]}]]
+
+    reset_blocks = core._reset_context_blocks_to_ref(
+        blocks,
+        conditioning=conditioning,
+        reset_denoise=0.50,
+        seed=0,
+        detail_preservation=0.50,
+    )
+    reset_cat = torch.cat(reset_blocks, dim=2)
+    # Seam token (t=-1) and overall prefix must not have their variance inflated toward 2.40
+    assert float(reset_cat[:, :, -1].std().item()) <= initial_std * 1.02
+    assert float(reset_cat.std().item()) <= 1.05
+
+

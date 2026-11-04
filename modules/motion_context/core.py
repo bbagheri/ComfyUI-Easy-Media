@@ -269,17 +269,17 @@ def _compute_latent_detail_gate(x: torch.Tensor) -> torch.Tensor:
         grad_mag.reshape(b * t, -1)
         .median(dim=1)
         .values.view(b * t, 1, 1, 1)
-        .clamp(min=1e-4)
+        .clamp(min=0.045)
     )
     grad_salience = ((grad_mag - 0.85 * grad_med).clamp(min=0.0) / (1.25 * grad_med)).clamp(
         0.0, 1.5
     )
-    aniso_score = (anisotropy * grad_salience).clamp(0.0, 1.0)
 
     lap_x = (pad[:, :, 1:-1, 2:] - 2.0 * flat + pad[:, :, 1:-1, :-2]).abs()
     lap_y = (pad[:, :, 2:, 1:-1] - 2.0 * flat + pad[:, :, :-2, 1:-1]).abs()
     nyq_energy = 0.25 * (lap_x + lap_y).mean(dim=1, keepdim=True)
     non_checker_ratio = (grad_mag / (grad_mag + nyq_energy + 1e-5)).clamp(0.0, 1.0)
+    aniso_score = (anisotropy * grad_salience * non_checker_ratio).clamp(0.0, 1.0)
     droplet_score = (
         ((grad_mag - 1.30 * grad_med).clamp(min=0.0) / (1.45 * grad_med))
         * non_checker_ratio
@@ -850,6 +850,13 @@ def _reset_context_blocks_to_ref(
             ref_mean, ref_std = ref_stats
             ref_mean = ref_mean.to(device=cat.device, dtype=torch.float32)
             ref_std = ref_std.to(device=cat.device, dtype=torch.float32)
+            # One-way variance anchor: allow clean references to damp inflated context
+            # channel std, but never allow noisy or high-contrast collage references to
+            # inflate context std above ctx_std or the global 0.985 ceiling.
+            safe_ref_std = torch.minimum(ref_std, ctx_std)
+            ref_global_std = float(safe_ref_std.mean().item())
+            if ref_global_std > 0.985:
+                safe_ref_std = safe_ref_std * (0.985 / ref_global_std)
             std_blend = min(0.85, r * 1.4)
             mean_blend = min(0.35, r * 0.5)
             mean_t = torch.ones((1, 1, t, 1, 1), device=cat.device, dtype=torch.float32)
@@ -860,7 +867,7 @@ def _reset_context_blocks_to_ref(
             if t >= 3:
                 mean_t[:, :, -2] = 0.70
                 std_t[:, :, -2] = 0.80
-            target_std = ctx_std + (std_blend * std_t) * (ref_std - ctx_std)
+            target_std = ctx_std + (std_blend * std_t) * (safe_ref_std - ctx_std)
             target_mean = ctx_mean + (mean_blend * mean_t) * (ref_mean - ctx_mean)
             cat = target_mean + (cat - ctx_mean) * (target_std / ctx_std)
             ctx_std = cat.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-5)

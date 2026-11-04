@@ -186,3 +186,39 @@ def test_degrain_context_suffix_structure_preserving_gate_keeps_fluid_filaments(
     assert (cleaned_noisy - base).pow(2).mean() < (noisy - base).pow(2).mean() * 0.35
 
 
+def test_degrain_reference_image_adaptively_scrubs_monte_carlo_noise_and_preserves_clean_images():
+    module = _load_minimax_utils()
+    torch.manual_seed(123)
+
+    # 1. Clean smooth gradient + sharp architectural edge: near-identity preservation
+    y_grid = torch.linspace(0.2, 0.6, 64).view(1, 64, 1, 1)
+    x_grid = torch.linspace(0.1, 0.4, 64).view(1, 1, 64, 1)
+    clean_img = (y_grid + x_grid).expand(1, 64, 64, 3).clone()
+    clean_img[:, :, 32:, :] += 0.35
+    out_clean = module._degrain_reference_image(clean_img, strength=0.65)
+    assert float((out_clean - clean_img).abs().max().item()) < 0.004
+    edge_jump = float((out_clean[:, :, 32, :] - out_clean[:, :, 31, :]).mean().item())
+    assert edge_jump > 0.345
+
+    # 2. Simulated un-denoised Cycles Monte Carlo render (uncorrelated 1px noise + fireflies)
+    mc_noise = (torch.randn_like(clean_img) * 0.018).clamp(-0.04, 0.04)
+    # Add isolated 1px Monte Carlo fireflies on smooth regions
+    mc_noisy = clean_img + mc_noise
+    mc_noisy[:, 16, 16, :] += 0.12
+    mc_noisy[:, 48, 12, :] += 0.14
+    out_noisy = module._degrain_reference_image(
+        mc_noisy, strength=0.65, detail_preservation=0.50
+    )
+    mse_before = float((mc_noisy - clean_img).pow(2).mean().item())
+    mse_after = float((out_noisy - clean_img).pow(2).mean().item())
+    assert mse_after < mse_before * 0.25
+    # Sharp edge is still preserved even when Monte Carlo noise is scrubbed
+    noisy_edge_jump = float((out_noisy[:, :, 32, :] - out_noisy[:, :, 31, :]).mean().item())
+    assert noisy_edge_jump > 0.32
+
+    # 3. strength=0.0 is an exact no-op
+    out_disabled = module._degrain_reference_image(mc_noisy, strength=0.0)
+    assert torch.equal(out_disabled, mc_noisy)
+
+
+
