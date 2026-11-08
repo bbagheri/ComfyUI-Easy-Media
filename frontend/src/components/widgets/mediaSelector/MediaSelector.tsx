@@ -15,6 +15,7 @@ import {
   Link2,
   Plus,
   RefreshCw,
+  Trash2,
 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -24,10 +25,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
 import { $error } from '@/lib/comfy-api'
+import { addMediaRevision } from '@/lib/media-url'
 import { uploadInputMediaFile } from '@/lib/media-upload'
 import { useDelayedIntersection } from '@/hooks/use-delayed-intersection'
 import type { SlotItem } from '@/lib/timeline-utils'
 import {
+  deleteMediaFile,
   getMediaList,
   getMediaListStoreRevision,
   getRecentMedia,
@@ -237,9 +240,9 @@ function FileThumbnail({
       )}
     >
       {showImage ? (
-        <LazyImage src={file.url} alt={file.name} className="w-full h-full object-cover" />
+        <LazyImage src={addMediaRevision(file.url, file.mtime)} alt={file.name} className="w-full h-full object-cover" />
       ) : showVideo ? (
-        <LazyVideo src={file.url} className="w-full h-full object-cover" />
+        <LazyVideo src={addMediaRevision(file.url, file.mtime)} className="w-full h-full object-cover" />
       ) : (
         <Icon className={`w-6 h-6 ${isAudio ? 'text-highlight' : 'text-muted-foreground'}`} />
       )}
@@ -470,9 +473,19 @@ function RemoteFileList({
     onSourceChange?.({ filePath: file.path, sourceType: actualSource })
   }
 
+  async function handleDeleteFile(file: MediaFileEntry) {
+    if (source !== 'inputs' && source !== 'outputs') return
+    try {
+      await deleteMediaFile(source, file.path)
+    } catch (err) {
+      console.error('[MediaSelector] failed to delete media file:', err)
+    }
+  }
+
   function renderGridFile(file: MediaFileEntry, selected: boolean) {
     const sourceType = fileSourceType(file)
     const selectionDisabled = multipleSelection && !selected && selectedValues.size >= selectionLimit
+    const canDelete = (source === 'inputs' || source === 'outputs') && !multipleSelection
     return (
       <div
         key={file.path}
@@ -480,7 +493,7 @@ function RemoteFileList({
         tabIndex={selectionDisabled ? -1 : 0}
         aria-disabled={selectionDisabled}
         className={cn(
-          'relative flex flex-col gap-1 text-left hover:opacity-80 transition-opacity',
+          'group/media-item relative flex flex-col gap-1 text-left hover:opacity-80 transition-opacity',
           selectionDisabled && 'cursor-not-allowed opacity-50',
         )}
         onClick={() => multipleSelection
@@ -495,6 +508,23 @@ function RemoteFileList({
         }}
       >
         <FileThumbnail file={file} mediaType={mediaType} isSelected={selected && !multipleSelection} />
+        {canDelete && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={t('common.delete')}
+            title={t('common.delete')}
+            data-testid={`media-selector-delete-${file.path}`}
+            className="absolute left-1 top-1 z-10 h-5 w-5 rounded bg-background/80 p-0 text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-destructive group-hover/media-item:opacity-100"
+            onClick={(event) => {
+              event.stopPropagation()
+              void handleDeleteFile(file)
+            }}
+          >
+            <Trash2 className="h-3 w-3" />
+          </Button>
+        )}
         {multipleSelection && (
           <Checkbox
             checked={selected}
@@ -522,6 +552,7 @@ function RemoteFileList({
     const showAudioIcon = !showThumb && !showVideoThumb && isAudioFile(file.name, mediaType)
     const sourceType = fileSourceType(file)
     const selectionDisabled = multipleSelection && !selected && selectedValues.size >= selectionLimit
+    const canDelete = (source === 'inputs' || source === 'outputs') && !multipleSelection
 
     return (
       <div
@@ -530,7 +561,7 @@ function RemoteFileList({
         tabIndex={selectionDisabled ? -1 : 0}
         aria-disabled={selectionDisabled}
         className={cn(
-          'flex items-center gap-2 px-2 py-1 text-left hover:bg-accent transition-colors',
+          'group/media-item flex items-center gap-2 px-2 py-1 text-left hover:bg-accent transition-colors',
           selected && 'bg-accent',
           selectionDisabled && 'cursor-not-allowed opacity-50',
         )}
@@ -556,12 +587,12 @@ function RemoteFileList({
         )}
         {showThumb && (
           <div className="w-4 h-4 rounded overflow-hidden shrink-0 bg-muted">
-            <LazyImage src={file.url} alt={file.name} className="w-full h-full object-cover" />
+            <LazyImage src={addMediaRevision(file.url, file.mtime)} alt={file.name} className="w-full h-full object-cover" />
           </div>
         )}
         {showVideoThumb && (
           <div className="w-4 h-4 rounded overflow-hidden shrink-0 bg-muted">
-            <LazyVideo src={file.url} className="w-full h-full object-cover" />
+            <LazyVideo src={addMediaRevision(file.url, file.mtime)} className="w-full h-full object-cover" />
           </div>
         )}
         {showAudioIcon && (
@@ -578,6 +609,23 @@ function RemoteFileList({
         <span className="text-[10px] text-muted-foreground shrink-0">
           {formatMediaInfo(file, mediaType)}
         </span>
+        {canDelete && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={t('common.delete')}
+            title={t('common.delete')}
+            data-testid={`media-selector-delete-${file.path}`}
+            className="h-5 w-5 shrink-0 rounded p-0 text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-destructive group-hover/media-item:opacity-100"
+            onClick={(event) => {
+              event.stopPropagation()
+              void handleDeleteFile(file)
+            }}
+          >
+            <Trash2 className="h-3 w-3" />
+          </Button>
+        )}
         {selected && !multipleSelection && <CheckCircle2 className="w-3.5 h-3.5 text-primary shrink-0" />}
       </div>
     )
@@ -808,7 +856,7 @@ export function MediaSelector({
       : activeTab === 'local'
         ? 'local'
         : 'inputs'
-    invalidateMediaListCache(source)
+    invalidateMediaListCache(source, { syncRemote: source === 'inputs' })
 
     if (refreshCooldownTimerRef.current !== null) {
       clearTimeout(refreshCooldownTimerRef.current)

@@ -8,7 +8,7 @@ import { useExpandedImagePreview } from '@/hooks/use-expanded-image-preview'
 import type { ReactWidgetProps } from '@/lib/create-react-widget'
 import { LocaleContext, useT } from '@/lib/i18n'
 import { mediaContentToViewUrl } from '@/lib/media-url'
-import { createTaskImage, splitSelectedTaskMedia, uploadTaskImageFile } from '@/lib/task-image-utils'
+import { createTaskImage, mergeOrUpdateTaskImages, splitSelectedTaskMedia, uploadTaskImageFile } from '@/lib/task-image-utils'
 import { invalidateMediaListCache } from '@/stores/media-list-store'
 import type { MultiTrackSourceType, MultiTrackTaskImage } from '@/types/multitrack'
 
@@ -53,14 +53,19 @@ export function MultiImagesLoaderWidget({ value, onChange, app }: Readonly<React
     const incoming = selected.map((item) => createTaskImage(item, sourceType(item, source)))
     commit(replaceId
       ? images.map((image) => image.id === replaceId ? { ...incoming[0], id: replaceId } : image)
-      : [...images, ...incoming])
+      : mergeOrUpdateTaskImages(images, incoming, MAX_IMAGES))
     setReplaceId(null)
     setSelectorOpen(false)
   }
 
   async function dropFiles(files: FileList | null) {
     if (!files?.length) return
-    const selected = Array.from(files).filter((file) => file.type.startsWith('image/')).slice(0, MAX_IMAGES - images.length)
+    const existingNames = new Set(images.map((img) => img.file_name ?? img.file_path))
+    const remainingSlots = MAX_IMAGES - images.length
+    const selected = Array.from(files)
+      .filter((file) => file.type.startsWith('image/'))
+      .filter((file, index) => existingNames.has(file.name) || index < remainingSlots)
+      .slice(0, MAX_IMAGES)
     const results = await Promise.allSettled(selected.map(uploadTaskImageFile))
     const uploaded: MultiTrackTaskImage[] = []
     for (const result of results) {
@@ -69,7 +74,7 @@ export function MultiImagesLoaderWidget({ value, onChange, app }: Readonly<React
     }
     if (uploaded.length) {
       invalidateMediaListCache('inputs')
-      commit([...images, ...uploaded])
+      commit(mergeOrUpdateTaskImages(images, uploaded, MAX_IMAGES))
     }
   }
 

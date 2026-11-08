@@ -1,8 +1,8 @@
-export async function uploadInputMediaFile(file: File, subfolder = ''): Promise<string> {
+export async function uploadInputMediaFile(file: File, subfolder = '', overwrite = true): Promise<string> {
   const form = new FormData()
   form.append('image', file)
   form.append('type', 'input')
-  form.append('overwrite', 'false')
+  form.append('overwrite', overwrite ? 'true' : 'false')
   if (subfolder) form.append('subfolder', subfolder)
   const response = await fetch('/upload/image', { method: 'POST', body: form })
   if (!response.ok) throw new Error(`Upload failed: ${response.status}`)

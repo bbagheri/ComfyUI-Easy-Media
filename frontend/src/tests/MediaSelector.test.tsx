@@ -507,4 +507,20 @@ describe('MediaSelector', () => {
     expect(onChange).toHaveBeenCalledWith('renders/recent.mp4', 'output')
     expect(fetch).toHaveBeenCalledWith('/easy-media/media/recent?source=outputs&type=video&hours=48&limit=50')
   })
+
+  it('deletes an input media file when clicking its delete button and refreshes the list', async () => {
+    render(<MediaSelector value="" mediaType="video" onChange={vi.fn()} />)
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'mediaSelector.tabInputs' }))
+    await screen.findByTitle('clip.mp4')
+
+    const deleteButton = screen.getByTestId('media-selector-delete-clips/clip.mp4')
+    fireEvent.click(deleteButton)
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith('/easy-media/media/file', expect.objectContaining({
+        method: 'DELETE',
+        body: JSON.stringify({ source: 'inputs', path: 'clips/clip.mp4' }),
+      }))
+    })
+  })
 })

@@ -171,6 +171,34 @@ def list_recent_media_files(
     return items[: max(1, min(1000, int(limit)))]
 
 
+def delete_media_file(
+    base_path: Path | str,
+    rel_path: str,
+    allowed: set[str] | None = None,
+) -> bool:
+    """Safely delete a single media file inside *base_path*."""
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        raise ValueError("path must be a non-empty string")
+    base_resolved = Path(base_path).resolve()
+    candidate = base_resolved / rel_path
+    if candidate.is_symlink():
+        raise ValueError("Refusing to delete symbolic link")
+    try:
+        target = candidate.resolve()
+        target.relative_to(base_resolved)
+    except ValueError as error:
+        raise ValueError("Invalid media path outside base directory") from error
+    if target == base_resolved or target.is_dir():
+        raise ValueError("Refusing to delete a directory")
+    allowed_set = allowed if allowed is not None else ALL_EXTENSIONS
+    if target.suffix.lower() not in allowed_set:
+        raise ValueError(f"Unsupported media file extension: {target.suffix}")
+    if not target.is_file():
+        raise FileNotFoundError(f"Media file not found: {rel_path}")
+    target.unlink()
+    return True
+
+
 def extract_filename_from_content_disposition(header: str | None) -> str | None:
     """Extract filename from Content-Disposition header."""
     if not header:

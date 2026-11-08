@@ -2,10 +2,17 @@ import sys
 import os
 import time
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from utils.media import allowed_extensions, file_entry, list_recent_media_files
+import folder_paths
+from utils.media import allowed_extensions, delete_media_file, file_entry, list_recent_media_files
+from utils.multitrack import (
+    image_data_files_signature,
+    multitrack_media_files_signature,
+    multitrack_segment_media_signature,
+)
 
 
 def test_file_entry_encodes_unicode_view_url_components(tmp_path):
@@ -68,3 +75,90 @@ def test_list_recent_media_files_recurses_and_filters_by_recency_and_type(tmp_pa
     )
 
     assert [item["path"] for item in items] == [str(Path("sub") / "nested" / "recent.mp4")]
+
+
+def test_delete_media_file_removes_allowed_file_and_blocks_traversal(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    img = input_dir / "office4.png"
+    img.write_bytes(b"png-v1")
+
+    deleted = delete_media_file(str(input_dir), "office4.png", allowed_extensions("all"))
+    assert deleted is True
+    assert not img.exists()
+
+    with pytest.raises(ValueError, match="outside base directory"):
+        delete_media_file(str(input_dir), "../outside.png", allowed_extensions("all"))
+
+
+def test_multitrack_media_signatures_change_when_input_file_overwritten_in_place(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    monkeypatch.setattr(folder_paths, "get_input_directory", lambda: str(input_dir))
+
+    img = input_dir / "office4.png"
+    img.write_bytes(b"png-version-1")
+    os.utime(img, (1700000000, 1700000000))
+
+    tracks_info = {
+        "tracks": [
+            {
+                "id": "track-task",
+                "type": "task",
+                "segments": [
+                    {
+                        "id": "seg-1",
+                        "start_frame": 0,
+                        "end_frame": 80,
+                        "content": {
+                            "type": "task",
+                            "images": [
+                                {
+                                    "id": "img-1",
+                                    "file_name": "office4.png",
+                                    "source_type": "input",
+                                    "file_path": "office4.png",
+                                    "shared_reference": True,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    sig1 = multitrack_media_files_signature(tracks_info)
+    seg_sig1 = multitrack_segment_media_signature(tracks_info, 0)
+    assert sig1 != ""
+    assert seg_sig1 != ""
+
+    # Overwrite the same file in-place with updated bytes and mtime
+    img.write_bytes(b"png-version-2-updated-content")
+    os.utime(img, (1700000010, 1700000010))
+
+    sig2 = multitrack_media_files_signature(tracks_info)
+    seg_sig2 = multitrack_segment_media_signature(tracks_info, 0)
+
+    assert sig1 != sig2
+    assert seg_sig1 != seg_sig2
+
+
+def test_image_data_files_signature_changes_when_input_file_overwritten(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    monkeypatch.setattr(folder_paths, "get_input_directory", lambda: str(input_dir))
+
+    img = input_dir / "hero.png"
+    img.write_bytes(b"v1")
+    os.utime(img, (1700000000, 1700000000))
+
+    payload = '{"images": [{"source_type": "input", "file_path": "hero.png"}]}'
+    sig1 = image_data_files_signature(payload)
+    assert sig1 != ""
+
+    img.write_bytes(b"v2-modified")
+    os.utime(img, (1700000005, 1700000005))
+
+    sig2 = image_data_files_signature(payload)
+    assert sig1 != sig2

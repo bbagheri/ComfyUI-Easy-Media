@@ -8,6 +8,7 @@ export interface ViewableMediaContent {
   local_path?: string
   url?: string
   slot_name?: string
+  media_revision?: string | number
 }
 
 function splitMediaPath(filePath: string): { filename: string; subfolder: string } {
@@ -30,13 +31,13 @@ export function addMediaRevision(url: string, revision?: string | number): strin
 }
 
 export function mediaContentToViewUrl(content: ViewableMediaContent): string | null {
-  if (content.url) return content.url
+  if (content.url) return addMediaRevision(content.url, content.media_revision)
   if (content.local_path) return `file://${content.local_path}`
   if (content.source_type !== 'input' && content.source_type !== 'output') return null
   if (!content.file_path) return null
 
   const typeParam = content.source_type === 'output' ? 'output' : 'input'
-  return mediaPathToViewUrl(content.file_path, typeParam)
+  return addMediaRevision(mediaPathToViewUrl(content.file_path, typeParam), content.media_revision)
 }
 
 export function mediaSlotNumber(slotName: string | undefined, fallbackIndex = 0): number {

@@ -58,6 +58,7 @@ from ..utils.minimax import (
     remove_output_files_by_prefix,
 )
 from ..utils.prompt_override import build_minimax_prompt_override_json
+from ..utils.multitrack import multitrack_segment_media_signature
 from ..utils.video import stage_passthrough_video_media
 
 
@@ -1642,6 +1643,8 @@ class EasyH3ConditioningCache(io.ComfyNode):
         del task_output_ready
         cache_path = cls._cache_path(segment_index)
         signature = h3_encoder_signature(clip, vae, audio_vae, model)
+        segment_media_sig = multitrack_segment_media_signature(tracks_info, int(segment_index))
+        cache_signature = f"{signature}:media={segment_media_sig}" if segment_media_sig else signature
         all_media_caches_hit = cls._all_media_caches_hit(tracks_info)
         scope_token, execution_id = cls._prepare_cache_pool(
             project_name,
@@ -1651,7 +1654,7 @@ class EasyH3ConditioningCache(io.ComfyNode):
         )
         staged_key = cls._staged_cache_key(
             cache_path,
-            signature,
+            cache_signature,
             scope_token,
             execution_id,
         )
@@ -1665,13 +1668,13 @@ class EasyH3ConditioningCache(io.ComfyNode):
                 return []
             if h3_conditioning_cache_matches(
                 cache_path,
-                signature,
+                cache_signature,
                 scope_token,
             ):
                 try:
                     restored = load_h3_conditioning_cache(
                         cache_path,
-                        signature,
+                        cache_signature,
                         scope_token,
                     )
                 except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -1704,6 +1707,8 @@ class EasyH3ConditioningCache(io.ComfyNode):
 
         cache_path = cls._cache_path(segment_index)
         signature = h3_encoder_signature(clip, vae, audio_vae, model)
+        segment_media_sig = multitrack_segment_media_signature(tracks_info, int(segment_index))
+        cache_signature = f"{signature}:media={segment_media_sig}" if segment_media_sig else signature
         all_media_caches_hit = cls._all_media_caches_hit(tracks_info)
         scope_token, execution_id = cls._prepare_cache_pool(
             project_name,
@@ -1713,7 +1718,7 @@ class EasyH3ConditioningCache(io.ComfyNode):
         )
         staged_key = cls._staged_cache_key(
             cache_path,
-            signature,
+            cache_signature,
             scope_token,
             execution_id,
         )
@@ -1727,7 +1732,7 @@ class EasyH3ConditioningCache(io.ComfyNode):
                 try:
                     restored = load_h3_conditioning_cache(
                         cache_path,
-                        signature,
+                        cache_signature,
                         scope_token,
                     )
                 except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -1758,7 +1763,7 @@ class EasyH3ConditioningCache(io.ComfyNode):
                 conditioning,
                 latent,
                 cache_path,
-                signature,
+                cache_signature,
                 scope_token,
             )
             log_node_info(

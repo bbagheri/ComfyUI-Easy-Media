@@ -174,6 +174,7 @@ export function MultiTrackSegmentBlock({
       local_path: image.local_path,
       url: image.url,
       slot_name: image.slot_name,
+      media_revision: image.media_revision,
     })
     return url ? [url] : []
   })

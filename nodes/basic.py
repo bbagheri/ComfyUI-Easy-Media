@@ -84,8 +84,11 @@ from ..utils.multitrack import (
     _resize_multitrack_video,
     _trim_track_audio,
     _video_stream_source,
+    image_data_files_signature,
     multitrack_audio_lock_is_effective,
+    multitrack_media_files_signature,
     multitrack_runtime_cache,
+    multitrack_segment_media_signature,
 )
 from ..utils.video import extract_video_audio
 
@@ -1822,6 +1825,17 @@ class MultiImagesLoader(io.ComfyNode):
         )
 
     @classmethod
+    def fingerprint_inputs(
+        cls,
+        resolution: str | dict,
+        max_limit: int,
+        image_data: str | dict,
+    ) -> str:
+        raw_data = image_data if isinstance(image_data, str) else json.dumps(image_data, sort_keys=True, default=str)
+        raw_res = resolution if isinstance(resolution, str) else json.dumps(resolution, sort_keys=True, default=str)
+        return f"{raw_res}:{max_limit}:{raw_data}:{image_data_files_signature(image_data)}"
+
+    @classmethod
     def execute(
         cls,
         resolution: str | dict,
@@ -1890,6 +1904,29 @@ class MultiTrackEditor(io.ComfyNode):
                 io.Video.Output("VIDEO", is_output_list=True),
             ],
         )
+
+    @classmethod
+    def fingerprint_inputs(
+        cls,
+        resolution: str | dict = "",
+        format: str = "Wan",
+        track_data: str | dict = "",
+        prompt_override: object = None,
+        **kwargs: object,
+    ) -> str:
+        del kwargs
+        raw_res = resolution[0] if isinstance(resolution, list) and resolution else resolution
+        raw_fmt = format[0] if isinstance(format, list) and format else format
+        raw_td = track_data[0] if isinstance(track_data, list) and track_data else track_data
+        raw_po = (
+            prompt_override[0]
+            if isinstance(prompt_override, list) and len(prompt_override) == 1
+            else prompt_override
+        )
+        res_str = raw_res if isinstance(raw_res, str) else json.dumps(raw_res, sort_keys=True, default=str)
+        td_str = raw_td if isinstance(raw_td, str) else json.dumps(raw_td, sort_keys=True, default=str)
+        po_str = raw_po if isinstance(raw_po, str) else json.dumps(raw_po, sort_keys=True, default=str)
+        return f"{res_str}:{raw_fmt}:{td_str}:{po_str}:{multitrack_media_files_signature(raw_td)}"
 
     @classmethod
     def check_lazy_status(
@@ -2866,10 +2903,12 @@ class MultiTrackTaskOutput(io.ComfyNode):
         # call so a video referenced by many locked audio/video tracks (or by
         # multiple iterations of the timeline loop below) decodes once.
         video_audio_cache: dict = {}
+        segment_media_sig = multitrack_segment_media_signature(info, requested_index)
         task_cache_key = (
             "multitrack_task_output",
             requested_index,
             selected_prompt_format,
+            segment_media_sig,
         )
         can_restore_runtime = (
             isinstance(runtime_cache, dict)

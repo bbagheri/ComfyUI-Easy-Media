@@ -51,8 +51,11 @@ from .utils.models import (
     get_model_info,
 )
 from .utils.media import (
+    ALL_EXTENSIONS,
     allowed_extensions,
+    delete_media_file,
     extract_filename_from_content_disposition,
+    file_entry,
     is_json_error,
     list_dir_shallow,
     list_recent_media_files,
@@ -197,16 +200,37 @@ def _segment_source_audio_window(data: dict, fps: float) -> tuple[float, float]:
     return source_start, duration
 
 
+async def _maybe_run_gdrive_sync(flag: str = "--pull-once", timeout: float = 8.0) -> None:
+    """Trigger an on-demand Google Drive sync on cloud pods when available."""
+    script = Path("/workspace/aimedia/gdrive_sync.py")
+    if not script.is_file():
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3",
+            str(script),
+            flag,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except Exception as exc:
+        print(f"[Easy Media] Optional gdrive_sync ({flag}) skipped/timed out: {exc}")
+
+
 @PromptServer.instance.routes.get("/easy-media/media/list")
 async def handle_media_list(request: web.Request) -> web.Response:
     source = request.rel_url.query.get("source", "inputs")
     media_type = request.rel_url.query.get("type", "all")
     local_path = request.rel_url.query.get("path", "")
     subfolder = request.rel_url.query.get("subfolder", "")
+    refresh = request.rel_url.query.get("refresh", "").lower() in ("1", "true", "yes")
 
     allowed = allowed_extensions(media_type)
 
     if source == "inputs":
+        if refresh:
+            await _maybe_run_gdrive_sync("--pull-once", timeout=8.0)
         base = Path(folder_paths.get_input_directory())
         items = list_dir_shallow(base, subfolder, "inputs", allowed)
     elif source == "outputs":
@@ -277,9 +301,44 @@ async def handle_media_recent(request: web.Request) -> web.Response:
     )
 
 
+@PromptServer.instance.routes.delete("/easy-media/media/file")
+async def handle_delete_media_file(request: web.Request) -> web.Response:
+    """Delete a media file from the inputs or outputs directory."""
+    try:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object")
+        source = str(payload.get("source") or request.rel_url.query.get("source") or "inputs")
+        rel_path = str(payload.get("path") or request.rel_url.query.get("path") or "")
+        if source in ("inputs", "input"):
+            base = Path(folder_paths.get_input_directory())
+            normalized_source = "inputs"
+        elif source in ("outputs", "output"):
+            base = Path(folder_paths.get_output_directory())
+            normalized_source = "outputs"
+        else:
+            raise ValueError(f"Unsupported source for deletion: {source}")
+        deleted = delete_media_file(base, rel_path, ALL_EXTENSIONS)
+        if normalized_source == "inputs":
+            asyncio.create_task(_maybe_run_gdrive_sync("--push-once", timeout=10.0))
+        return web.json_response({"deleted": deleted, "source": normalized_source, "path": rel_path})
+    except FileNotFoundError as error:
+        return web.json_response({"error": str(error)}, status=404)
+    except (TypeError, ValueError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    except Exception as error:
+        traceback.print_exc()
+        return web.json_response({"error": f"Failed to delete media file: {error}"}, status=500)
+
+
 @PromptServer.instance.routes.post("/easy-media/upload")
 async def handle_easy_upload(request: web.Request) -> web.Response:
-    """Upload any file to the ComfyUI input directory."""
+    """Upload any file to the ComfyUI input directory (overwriting by default)."""
+    overwrite_query = request.rel_url.query.get("overwrite", "true").lower()
+    overwrite = overwrite_query not in ("0", "false", "no")
     reader = await request.multipart()
     field = await reader.next()
     if field is None:
@@ -289,14 +348,14 @@ async def handle_easy_upload(request: web.Request) -> web.Response:
             text=json.dumps({"error": "No file field provided"}),
         )
 
-    original_name = field.filename or f"upload_{uuid.uuid4().hex[:8]}"
+    original_name = Path(field.filename or f"upload_{uuid.uuid4().hex[:8]}").name
     stem = Path(original_name).stem
     ext = Path(original_name).suffix
 
     input_dir = Path(folder_paths.get_input_directory())
     filename = original_name
     target = input_dir / filename
-    if target.exists():
+    if target.exists() and not overwrite:
         filename = f"{stem}_{uuid.uuid4().hex[:8]}{ext}"
         target = input_dir / filename
 
@@ -307,9 +366,10 @@ async def handle_easy_upload(request: web.Request) -> web.Response:
                 break
             fp.write(chunk)
 
+    entry = file_entry(str(target), filename, "inputs")
     return web.Response(
         content_type="application/json",
-        text=json.dumps({"file_name": filename}),
+        text=json.dumps({"file_name": filename, "mtime": entry.get("mtime")}),
     )
 
 

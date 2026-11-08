@@ -40,6 +40,7 @@ import {
   createTaskImage,
   canEnableSharedTaskImage,
   MAX_TASK_IMAGES,
+  mergeOrUpdateTaskImages,
   sharedTaskImageUpdates,
   splitSelectedTaskMedia,
   taskImageIdentity,
@@ -141,6 +142,7 @@ function getActiveTaskImages(data: TrackData, currentTime: number): ActiveTaskIm
         local_path: image.local_path,
         url: image.url,
         slot_name: image.slot_name,
+        media_revision: image.media_revision,
       })
       return { image, url: url ?? undefined }
     })
@@ -507,11 +509,12 @@ export function PreviewArea({
     event.preventDefault()
     setActiveTaskImageDragOver(false)
     if (!event.dataTransfer || !activeTaskImages) return
+    const existingNames = new Set(activeTaskImages.allImages.map((img) => img.file_name ?? img.file_path))
     const remainingSlots = MAX_TASK_IMAGES - activeTaskImages.allImages.length
-    if (remainingSlots <= 0) return
-    const files = Array.from(event.dataTransfer.files)
-      .filter((file) => file.type.startsWith('image/'))
-      .slice(0, remainingSlots)
+    const allImageFiles = Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith('image/'))
+    const files = allImageFiles.filter((file, index) => (
+      existingNames.has(file.name) || index < remainingSlots
+    )).slice(0, MAX_TASK_IMAGES)
     if (files.length === 0) return
 
     const results = await Promise.allSettled(files.map((file) => uploadTaskImageFile(file)))
@@ -524,7 +527,7 @@ export function PreviewArea({
     invalidateMediaListCache('inputs')
     onTrackSegmentsContentChange?.([{
       segmentId: activeTaskImages.segmentId,
-      patch: { images: [...activeTaskImages.allImages, ...uploaded] },
+      patch: { images: mergeOrUpdateTaskImages(activeTaskImages.allImages, uploaded) },
     }])
   }
 
@@ -538,7 +541,7 @@ export function PreviewArea({
     if (nextImages.length === 0) return
     onTrackSegmentsContentChange?.([{
       segmentId: activeTaskImages.segmentId,
-      patch: { images: [...activeTaskImages.allImages, ...nextImages] },
+      patch: { images: mergeOrUpdateTaskImages(activeTaskImages.allImages, nextImages) },
     }])
     setActiveTaskMediaSelectorOpen(false)
   }
@@ -1282,6 +1285,7 @@ export function PreviewArea({
       local_path: image.local_path,
       url: image.url,
       slot_name: image.slot_name,
+      media_revision: image.media_revision,
     })
     if (!imageUrl) return null
     const imageName = image.file_name ?? image.file_path ?? image.local_path ?? image.url ?? image.id

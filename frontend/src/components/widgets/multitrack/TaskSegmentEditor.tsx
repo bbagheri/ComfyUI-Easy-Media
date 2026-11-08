@@ -48,6 +48,7 @@ import {
   activeTaskImages,
   canEnableSharedTaskImage,
   MAX_TASK_IMAGES,
+  mergeOrUpdateTaskImages,
   sharedTaskImageUpdates,
   splitSelectedTaskMedia,
   taskImageIdentity,
@@ -303,6 +304,7 @@ export function TaskSegmentEditor({
         local_path: image.local_path,
         url: image.url,
         slot_name: image.slot_name,
+        media_revision: image.media_revision,
       }) ?? undefined,
     }))
     const videoTracks = mediaTracks.filter((track) => (
@@ -432,11 +434,12 @@ export function TaskSegmentEditor({
     event.preventDefault()
     setIsImageDragOver(false)
     if (!event.dataTransfer) return
+    const existingNames = new Set(images.map((img) => img.file_name ?? img.file_path))
     const remainingSlots = MAX_TASK_IMAGES - images.length
-    if (remainingSlots <= 0) return
-    const files = Array.from(event.dataTransfer.files)
-      .filter((file) => file.type.startsWith('image/'))
-      .slice(0, remainingSlots)
+    const allImageFiles = Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith('image/'))
+    const files = allImageFiles.filter((file, index) => (
+      existingNames.has(file.name) || index < remainingSlots
+    )).slice(0, MAX_TASK_IMAGES)
     if (files.length === 0) return
 
     const results = await Promise.allSettled(files.map((file) => uploadTaskImageFile(file)))
@@ -447,7 +450,7 @@ export function TaskSegmentEditor({
     })
     if (uploaded.length > 0) {
       invalidateMediaListCache('inputs')
-      onContentChange({ images: [...images, ...uploaded] })
+      onContentChange({ images: mergeOrUpdateTaskImages(images, uploaded) })
     }
   }
 
@@ -491,7 +494,7 @@ export function TaskSegmentEditor({
         images: images.map((image) => image.id === reselectImageId ? replacement : image),
       })
     } else {
-      onContentChange({ images: [...images, ...nextImages] })
+      onContentChange({ images: mergeOrUpdateTaskImages(images, nextImages) })
     }
     setReselectImageId(null)
     setMediaSelectorOpen(false)
@@ -806,6 +809,7 @@ export function TaskSegmentEditor({
                       local_path: image.local_path,
                       url: image.url,
                       slot_name: image.slot_name,
+                      media_revision: image.media_revision,
                     })
                     const canShareImage = image.shared_reference === true
                       || canEnableSharedTaskImage(editableSegments, image)

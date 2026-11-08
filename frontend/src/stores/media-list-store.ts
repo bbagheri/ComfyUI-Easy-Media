@@ -59,6 +59,11 @@ const generations: Record<MediaListSource, number> = {
   outputs: 0,
   local: 0,
 }
+const pendingRemoteSync: Record<MediaListSource, boolean> = {
+  inputs: false,
+  outputs: false,
+  local: false,
+}
 
 function requestKey(request: MediaListRequest): string {
   return JSON.stringify(request)
@@ -77,10 +82,11 @@ function normalizeMediaItems(data: unknown): MediaItem[] {
   }, [])
 }
 
-function mediaListUrl(request: MediaListRequest): string {
+function mediaListUrl(request: MediaListRequest, syncRemote = false): string {
   const params = new URLSearchParams({ source: request.source, type: request.mediaType })
   if (request.source === 'local') params.set('path', request.localPath)
   if (request.subfolder) params.set('subfolder', request.subfolder)
+  if (syncRemote && request.source === 'inputs') params.set('refresh', '1')
   return `/easy-media/media/list?${params}`
 }
 
@@ -92,8 +98,10 @@ export function getMediaList(request: MediaListRequest): Promise<MediaItem[]> {
   const activeRequest = pending.get(key)
   if (activeRequest) return activeRequest.promise
 
+  const syncRemote = pendingRemoteSync[request.source]
+  pendingRemoteSync[request.source] = false
   const requestGeneration = generations[request.source]
-  const promise = fetch(mediaListUrl(request))
+  const promise = fetch(mediaListUrl(request, syncRemote))
     .then((response) => {
       if (!response.ok) throw new Error(`${response.status}`)
       return response.json() as Promise<unknown>
@@ -145,13 +153,26 @@ export async function getRecentMediaHistory(
   return [...outputFiles, ...tempFiles].sort((left, right) => right.mtime - left.mtime)
 }
 
-export function invalidateMediaListCache(source?: MediaListSource): void {
+export function invalidateMediaListCache(
+  source?: MediaListSource,
+  options?: { syncRemote?: boolean },
+): void {
   if (source) {
     generations[source] += 1
+    if (options?.syncRemote) pendingRemoteSync[source] = true
   } else {
     generations.inputs += 1
     generations.outputs += 1
     generations.local += 1
+    if (options?.syncRemote) {
+      pendingRemoteSync.inputs = true
+      pendingRemoteSync.outputs = true
+      pendingRemoteSync.local = true
+    } else {
+      pendingRemoteSync.inputs = false
+      pendingRemoteSync.outputs = false
+      pendingRemoteSync.local = false
+    }
   }
   for (const [key, entry] of cache) {
     if (!source || entry.request.source === source) cache.delete(key)
@@ -161,6 +182,21 @@ export function invalidateMediaListCache(source?: MediaListSource): void {
   }
   revision += 1
   listeners.forEach((listener) => listener())
+}
+
+export async function deleteMediaFile(
+  source: 'inputs' | 'outputs',
+  filePath: string,
+): Promise<void> {
+  const response = await fetch('/easy-media/media/file', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source, path: filePath }),
+  })
+  if (!response.ok) {
+    throw new Error(`Failed to delete media file: ${response.status}`)
+  }
+  invalidateMediaListCache(source)
 }
 
 export function clearMediaListCache(): void {

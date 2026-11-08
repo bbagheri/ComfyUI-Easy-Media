@@ -27,11 +27,17 @@ describe('media view urls', () => {
     )
   })
 
-  it('builds generic media urls for input video content', () => {
+  it('builds generic media urls for input video content and appends media_revision when present', () => {
     expect(mediaContentToViewUrl({
       source_type: 'input',
       file_path: 'clips/shot 01.mp4',
     })).toBe('/view?filename=shot%2001.mp4&type=input&subfolder=clips')
+
+    expect(mediaContentToViewUrl({
+      source_type: 'input',
+      file_path: 'office4.png',
+      media_revision: '1700000010',
+    })).toBe('/view?filename=office4.png&type=input&subfolder=&v=1700000010')
   })
 
   it('encodes unicode video filename and subfolder as URL components', () => {

@@ -212,7 +212,7 @@ async function uploadImageFile(file: File): Promise<string> {
   const form = new FormData()
   form.append('image', file)
   form.append('type', 'input')
-  form.append('overwrite', 'false')
+  form.append('overwrite', 'true')
   const res = await fetch('/upload/image', { method: 'POST', body: form })
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
   const json = await res.json() as { name: string; subfolder?: string }

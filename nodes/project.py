@@ -48,7 +48,9 @@ from ..utils.project_memory import (
 )
 from ..utils.multitrack import (
     MULTITRACK_RUNTIME_CACHE_KEY,
+    multitrack_media_files_signature,
     multitrack_runtime_cache,
+    multitrack_segment_media_signature,
 )
 
 
@@ -701,6 +703,10 @@ class EasyH3ProjectStaticPrepare(io.ComfyNode):
                 if not isinstance(project_static, dict):
                     raise TypeError("project_static must contain H3 project static data")
                 segment_cache = project_static.get("_segment_cache")
+                segment_media_sig = multitrack_segment_media_signature(
+                    project_static.get("task_tracks_info_base", {}),
+                    int(task_index),
+                )
                 segment_cache_key = (
                     "h3_project_segment",
                     int(task_start_frame),
@@ -708,6 +714,7 @@ class EasyH3ProjectStaticPrepare(io.ComfyNode):
                     int(task_duration_frames),
                     float(fps),
                     str(generation_mode),
+                    segment_media_sig,
                 )
                 cached_segment = (
                     segment_cache.get(segment_cache_key)
@@ -764,6 +771,7 @@ class EasyH3ProjectStaticPrepare(io.ComfyNode):
             media_data = None
             locked = None
             if tracks_info is not None:
+                media_sig = multitrack_media_files_signature(tracks_info)
                 runtime_cache = multitrack_runtime_cache(
                     tracks_info,
                     create=True,
@@ -773,7 +781,10 @@ class EasyH3ProjectStaticPrepare(io.ComfyNode):
                     if isinstance(runtime_cache, dict)
                     else None
                 )
-                if isinstance(cached_media, dict):
+                if (
+                    isinstance(cached_media, dict)
+                    and cached_media.get("_media_files_signature", media_sig) == media_sig
+                ):
                     media_data = cached_media
                     locked = cached_media.get("full_locked_audio")
                     media_data["_cache_status"] = {
@@ -796,6 +807,7 @@ class EasyH3ProjectStaticPrepare(io.ComfyNode):
                         "shared_audio": audio,
                         "shared_video": video,
                         "full_locked_audio": locked,
+                        "_media_files_signature": media_sig,
                         "_segment_cache": {},
                         "_cache_status": {
                             "project_media": "首次加载",

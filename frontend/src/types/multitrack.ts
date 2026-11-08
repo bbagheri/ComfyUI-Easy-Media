@@ -29,6 +29,7 @@ export interface MultiTrackTaskImage {
   url?: string
   slot_name?: string
   file_name?: string
+  media_revision?: string
   panorama_view?: MultiTrackPanoramaView
   shared_reference?: boolean
   shared_reference_copy?: boolean
@@ -43,6 +44,7 @@ export interface MultiTrackSegmentContent {
   url?: string
   slot_name?: string
   file_name?: string
+  media_revision?: string
   text?: string
   user_prompt?: string
   user_prompt_b?: string

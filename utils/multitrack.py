@@ -320,6 +320,202 @@ def _parse_track_data(track_data: str | dict) -> dict:
 MULTITRACK_RUNTIME_CACHE_KEY = "_easy_media_runtime_cache"
 
 
+def _resolve_multitrack_disk_media_path(descriptor: dict) -> "os.PathLike | None":
+    from pathlib import Path
+    import folder_paths
+
+    if not isinstance(descriptor, dict):
+        return None
+    if multitrack_slot_name(descriptor) is not None:
+        return None
+    source_type = str(descriptor.get("source_type", "input") or "input").lower()
+    if source_type in {"url", "slot", "preset"}:
+        return None
+    if source_type == "local":
+        raw_path = descriptor.get("local_path") or descriptor.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+        return Path(raw_path)
+    raw_path = descriptor.get("file_path") or descriptor.get("file_name")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    try:
+        base_dir = (
+            Path(folder_paths.get_output_directory())
+            if source_type == "output"
+            else Path(folder_paths.get_input_directory())
+        )
+    except Exception:
+        return None
+    return base_dir / raw_path
+
+
+def _stat_media_descriptor(descriptor: dict) -> tuple[str, str, int, int] | None:
+    identity = multitrack_media_identity(descriptor)
+    if identity is None:
+        return None
+    path = _resolve_multitrack_disk_media_path(descriptor)
+    if path is None:
+        return (identity[0], identity[1], -1, -1)
+    try:
+        st = path.stat()
+        return (identity[0], identity[1], int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return (identity[0], identity[1], 0, 0)
+
+
+def _collect_track_media_stats(info: dict, segment_index: int | None = None) -> list[tuple[str, str, int, int]]:
+    if segment_index is not None and segment_index < 0:
+        segment_index = None
+    stats: list[tuple[str, str, int, int]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _record(desc: object) -> None:
+        if not isinstance(desc, dict):
+            return
+        st = _stat_media_descriptor(desc)
+        if st is None:
+            return
+        key = (st[0], st[1])
+        if key not in seen:
+            seen.add(key)
+            stats.append(st)
+
+    for shared_source in info.get("_project_shared_image_sources", []) or []:
+        if isinstance(shared_source, (list, tuple)) and len(shared_source) == 2:
+            _record({"source_type": str(shared_source[0]), "file_path": str(shared_source[1])})
+
+    tracks = info.get("tracks", [])
+    if isinstance(tracks, list):
+        for shared_image in multitrack_shared_task_images(tracks):
+            _record(shared_image)
+
+        task_segments: list[dict] = []
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            track_type = str(track.get("type", ""))
+            segments = track.get("segments", [])
+            if not isinstance(segments, list):
+                continue
+            if track_type == "task":
+                for seg in segments:
+                    if isinstance(seg, dict):
+                        task_segments.append(seg)
+            elif track_type in {"audio", "video"}:
+                for seg in segments:
+                    if not isinstance(seg, dict):
+                        continue
+                    content = seg.get("content", {})
+                    if not isinstance(content, dict):
+                        continue
+                    if segment_index is None or multitrack_is_shared_reference(content) or track.get("audio_locked") is True:
+                        _record(content)
+            elif track_type == "subtitle" and segment_index is None:
+                for seg in segments:
+                    if not isinstance(seg, dict):
+                        continue
+                    content = seg.get("content", {})
+                    speech = content.get("subtitle_speech") if isinstance(content, dict) else None
+                    if isinstance(speech, dict) and speech.get("referenceAudio"):
+                        _record({
+                            "source_type": speech.get("referenceAudioSourceType", "input"),
+                            "file_path": speech.get("referenceAudio"),
+                        })
+
+        task_segments.sort(key=lambda s: _multitrack_frame_value(s.get("start_frame")))
+        target_tasks = (
+            [task_segments[segment_index]]
+            if segment_index is not None and 0 <= segment_index < len(task_segments)
+            else task_segments if segment_index is None else []
+        )
+        for seg in target_tasks:
+            content = seg.get("content", {})
+            if not isinstance(content, dict):
+                continue
+            for img in content.get("images", []) if isinstance(content.get("images"), list) else []:
+                if isinstance(img, dict) and not multitrack_is_muted_image(img):
+                    _record(img)
+            if segment_index is not None:
+                seg_start = _multitrack_frame_value(seg.get("start_frame"))
+                seg_end = _multitrack_frame_value(seg.get("end_frame"), seg_start)
+                for track in tracks:
+                    if not isinstance(track, dict) or track.get("type") not in {"audio", "video"}:
+                        continue
+                    for mseg in multitrack_segments_in_window(track, seg_start, seg_end):
+                        _record(mseg.get("content", {}))
+
+    if segment_index is None:
+        media = info.get("media")
+        if isinstance(media, dict):
+            for group in ("images", "audio", "video"):
+                items = media.get(group)
+                if isinstance(items, list):
+                    for item in items:
+                        _record(item)
+
+    return stats
+
+
+def multitrack_media_files_signature(track_data: object) -> str:
+    """Return a deterministic SHA-256 signature of all referenced media files and their disk stats."""
+    import hashlib
+
+    while isinstance(track_data, (list, tuple)) and len(track_data) == 1:
+        track_data = track_data[0]
+    try:
+        info = _parse_track_data(track_data) if isinstance(track_data, (str, dict)) else {}
+    except ValueError:
+        return ""
+    stats = _collect_track_media_stats(info, segment_index=None)
+    if not stats:
+        return ""
+    payload = json.dumps(stats, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def multitrack_segment_media_signature(track_data: object, segment_index: int) -> str:
+    """Return a deterministic SHA-256 signature of media files referenced by one segment + shared refs."""
+    import hashlib
+
+    while isinstance(track_data, (list, tuple)) and len(track_data) == 1:
+        track_data = track_data[0]
+    try:
+        info = _parse_track_data(track_data) if isinstance(track_data, (str, dict)) else {}
+    except ValueError:
+        return ""
+    stats = _collect_track_media_stats(info, segment_index=int(segment_index))
+    if not stats:
+        return ""
+    payload = json.dumps(stats, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def image_data_files_signature(image_data: object) -> str:
+    """Return a deterministic SHA-256 signature for MultiImagesLoader IMAGE_DATA items on disk."""
+    import hashlib
+
+    while isinstance(image_data, (list, tuple)) and len(image_data) == 1:
+        image_data = image_data[0]
+    if isinstance(image_data, str):
+        try:
+            image_data = json.loads(image_data)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(image_data, dict) or not isinstance(image_data.get("images"), list):
+        return ""
+    stats: list[tuple[str, str, int, int]] = []
+    for item in image_data["images"]:
+        if isinstance(item, dict):
+            st = _stat_media_descriptor(item)
+            if st is not None:
+                stats.append(st)
+    if not stats:
+        return ""
+    payload = json.dumps(stats, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def multitrack_runtime_cache(
     track_data: object,
     *,
